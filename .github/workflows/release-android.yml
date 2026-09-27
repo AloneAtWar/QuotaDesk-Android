@@ -73,7 +73,7 @@ jobs:
             echo "Missing one or more Android signing repository Actions secrets." >&2
             exit 1
           fi
-          ./gradlew --no-daemon :app:assembleRelease \
+          bash ./gradlew --no-daemon :app:assembleRelease \
             -PappVersionName="$APP_VERSION_NAME" \
             -PappVersionCode="$APP_VERSION_CODE"
 
