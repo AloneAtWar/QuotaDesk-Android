@@ -9,6 +9,8 @@ import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.text.InputType;
 import android.view.Gravity;
 import android.view.View;
@@ -60,12 +62,15 @@ public final class MainActivity extends ComponentActivity {
     private static final String PREFS = "quota_desk_mobile";
     private static final String PREF_PROFILES = "device_profiles_v1";
     private static final String PREF_LIGHT_THEME = "light_theme_v1";
+    private static final long CONNECTION_TIMEOUT_MS = 12_000L;
 
     private final List<DeviceProfile> devices = new ArrayList<>();
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private ActivityResultLauncher<Intent> scanLauncher;
     private WebView webView;
     private View webError;
     private TextView loadingLabel;
+    private Runnable connectionTimeout;
     private DeviceProfile activeProfile;
     private boolean showingDashboard;
     private boolean lightTheme;
@@ -383,6 +388,15 @@ public final class MainActivity extends ComponentActivity {
         open.setOnClickListener(view -> showDashboard(profile, null));
         card.addView(open);
 
+        TextView remove = label("移除", 12, lightTheme ? Color.rgb(190, 82, 73) : Color.rgb(239, 138, 112), true);
+        remove.setPadding(dp(9), dp(8), dp(9), dp(8));
+        remove.setBackground(round(RAISED, 10, BORDER, 1));
+        remove.setContentDescription("移除设备 " + profile.name);
+        remove.setOnClickListener(view -> confirmRemoveDevice(profile));
+        LinearLayout.LayoutParams removeParams = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        removeParams.leftMargin = dp(6);
+        card.addView(remove, removeParams);
+
         card.setOnLongClickListener(view -> {
             showDeviceActions(profile);
             return true;
@@ -511,13 +525,20 @@ public final class MainActivity extends ComponentActivity {
 
             @Override public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
                 if (loadingLabel != null) loadingLabel.setVisibility(View.VISIBLE);
+                scheduleConnectionTimeout();
                 if (webError != null && webError.getParent() instanceof ViewGroup) {
                     ((ViewGroup) webError.getParent()).removeView(webError);
                     webError = null;
                 }
             }
 
+            @Override public void onPageCommitVisible(WebView view, String url) {
+                cancelConnectionTimeout();
+                if (loadingLabel != null) loadingLabel.setVisibility(View.GONE);
+            }
+
             @Override public void onPageFinished(WebView view, String url) {
+                cancelConnectionTimeout();
                 if (loadingLabel != null) loadingLabel.setVisibility(View.GONE);
             }
 
@@ -547,6 +568,7 @@ public final class MainActivity extends ComponentActivity {
 
     private void showWebFailure(String message) {
         if (!showingDashboard || webView == null) return;
+        cancelConnectionTimeout();
         if (webError != null && webError.getParent() instanceof ViewGroup) {
             ((ViewGroup) webError.getParent()).removeView(webError);
         }
@@ -585,6 +607,22 @@ public final class MainActivity extends ComponentActivity {
         if (loadingLabel != null) loadingLabel.setVisibility(View.GONE);
     }
 
+    private void scheduleConnectionTimeout() {
+        cancelConnectionTimeout();
+        connectionTimeout = () -> {
+            if (!showingDashboard || webView == null || loadingLabel == null || loadingLabel.getVisibility() != View.VISIBLE) return;
+            webView.stopLoading();
+            showWebFailure("连接电脑超过 12 秒。请确认电脑端 Quota Desk 正在运行，并检查手机当前网络、VPN 或内网穿透连接。");
+        };
+        mainHandler.postDelayed(connectionTimeout, CONNECTION_TIMEOUT_MS);
+    }
+
+    private void cancelConnectionTimeout() {
+        if (connectionTimeout == null) return;
+        mainHandler.removeCallbacks(connectionTimeout);
+        connectionTimeout = null;
+    }
+
     private boolean sameOrigin(Uri first, Uri second) {
         String firstScheme = first.getScheme();
         String secondScheme = second.getScheme();
@@ -611,6 +649,7 @@ public final class MainActivity extends ComponentActivity {
 
     @SuppressLint("SetJavaScriptEnabled")
     private void destroyWebView() {
+        cancelConnectionTimeout();
         WebView old = webView;
         webView = null;
         loadingLabel = null;
