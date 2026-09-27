@@ -103,7 +103,7 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v3.0.3
         with:
-          name: Quota Desk Android ${{ github.ref_name }}
+          name: ${{ env.APP_VERSION_NAME }}
           body_path: ${{ env.RELEASE_NOTES_PATH }}
           fail_on_unmatched_files: true
           files: |

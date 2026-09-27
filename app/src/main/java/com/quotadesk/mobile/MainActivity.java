@@ -45,6 +45,12 @@ import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -63,6 +69,7 @@ public final class MainActivity extends ComponentActivity {
     private static final String PREF_PROFILES = "device_profiles_v1";
     private static final String PREF_LIGHT_THEME = "light_theme_v1";
     private static final long CONNECTION_TIMEOUT_MS = 12_000L;
+    private static final String LATEST_RELEASE_API = "https://api.github.com/repos/AloneAtWar/QuotaDesk-Android/releases/latest";
 
     private final List<DeviceProfile> devices = new ArrayList<>();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -74,6 +81,7 @@ public final class MainActivity extends ComponentActivity {
     private DeviceProfile activeProfile;
     private boolean showingDashboard;
     private boolean lightTheme;
+    private boolean updateCheckInProgress;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -106,6 +114,7 @@ public final class MainActivity extends ComponentActivity {
             }
         });
         showDevices();
+        mainHandler.postDelayed(() -> checkForUpdates(false), 800L);
     }
 
     @Override
@@ -353,7 +362,156 @@ public final class MainActivity extends ComponentActivity {
         note.setLineSpacing(dp(3), 1f);
         note.setPadding(dp(3), 0, dp(3), 0);
         content.addView(note);
+
+        TextView update = label("检查更新  ·  当前 " + currentVersion(), 12, MUTED, true);
+        update.setGravity(Gravity.CENTER);
+        update.setMinHeight(dp(46));
+        update.setBackground(round(SURFACE, 13, BORDER, 1));
+        update.setOnClickListener(view -> checkForUpdates(true));
+        LinearLayout.LayoutParams updateParams = matchWidth();
+        updateParams.topMargin = dp(18);
+        content.addView(update, updateParams);
         setContentView(root);
+    }
+
+    private void checkForUpdates(boolean userInitiated) {
+        if (updateCheckInProgress) {
+            if (userInitiated) toast("正在检查更新…");
+            return;
+        }
+        updateCheckInProgress = true;
+        if (userInitiated) toast("正在检查更新…");
+        new Thread(() -> {
+            UpdateRelease release = null;
+            String errorMessage = null;
+            try {
+                release = fetchLatestRelease();
+            } catch (Exception error) {
+                errorMessage = error.getMessage();
+            }
+            UpdateRelease result = release;
+            String failure = errorMessage;
+            mainHandler.post(() -> {
+                updateCheckInProgress = false;
+                if (isFinishing() || isDestroyed()) return;
+                if (failure != null) {
+                    if (userInitiated) toast("检查更新失败，请稍后重试");
+                    return;
+                }
+                if (result != null && compareVersions(result.version, currentVersion()) > 0) {
+                    if (userInitiated || !showingDashboard) showUpdateDialog(result);
+                } else if (userInitiated) {
+                    toast("当前已是最新版本 " + currentVersion());
+                }
+            });
+        }, "QuotaDesk-update-check").start();
+    }
+
+    private UpdateRelease fetchLatestRelease() throws IOException, JSONException {
+        HttpURLConnection connection = (HttpURLConnection) new URL(LATEST_RELEASE_API).openConnection();
+        connection.setConnectTimeout(8_000);
+        connection.setReadTimeout(8_000);
+        connection.setRequestProperty("Accept", "application/vnd.github+json");
+        connection.setRequestProperty("X-GitHub-Api-Version", "2022-11-28");
+        connection.setRequestProperty("User-Agent", "QuotaDesk-Android/" + currentVersion());
+        try {
+            int status = connection.getResponseCode();
+            if (status != HttpURLConnection.HTTP_OK) throw new IOException("GitHub returned " + status);
+            StringBuilder json = new StringBuilder();
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(connection.getInputStream(), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = reader.readLine()) != null) json.append(line);
+            }
+            JSONObject release = new JSONObject(json.toString());
+            String version = normalizeVersion(release.optString("tag_name"));
+            if (version.isEmpty()) throw new JSONException("Release version is missing");
+            String releaseUrl = release.optString("html_url");
+            String downloadUrl = releaseUrl;
+            JSONArray assets = release.optJSONArray("assets");
+            if (assets != null) {
+                for (int index = 0; index < assets.length(); index++) {
+                    JSONObject asset = assets.optJSONObject(index);
+                    if (asset == null || !asset.optString("name").toLowerCase(Locale.ROOT).endsWith(".apk")) continue;
+                    String candidate = asset.optString("browser_download_url");
+                    if (!candidate.isEmpty()) {
+                        downloadUrl = candidate;
+                        break;
+                    }
+                }
+            }
+            if (downloadUrl.isEmpty()) throw new JSONException("Release download URL is missing");
+            return new UpdateRelease(version, release.optString("body"), downloadUrl);
+        } finally {
+            connection.disconnect();
+        }
+    }
+
+    private void showUpdateDialog(UpdateRelease release) {
+        String notes = formatReleaseNotes(release.notes);
+        new AlertDialog.Builder(this)
+                .setTitle("发现新版本 " + release.version)
+                .setMessage(notes.isEmpty() ? "新版本已经可以下载。" : notes)
+                .setNegativeButton("稍后", null)
+                .setPositiveButton("下载更新", (dialog, which) -> openExternalUrl(release.downloadUrl))
+                .show();
+    }
+
+    private void openExternalUrl(String value) {
+        try {
+            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(value)));
+        } catch (Exception error) {
+            toast("无法打开下载链接");
+        }
+    }
+
+    private String currentVersion() {
+        try {
+            String value = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+            return value == null || value.trim().isEmpty() ? "未知" : value.trim();
+        } catch (Exception ignored) {
+            return "未知";
+        }
+    }
+
+    private String normalizeVersion(String value) {
+        String normalized = value == null ? "" : value.trim();
+        if (normalized.startsWith("v") || normalized.startsWith("V")) normalized = normalized.substring(1);
+        int suffix = normalized.indexOf('-');
+        if (suffix >= 0) normalized = normalized.substring(0, suffix);
+        return normalized;
+    }
+
+    private int compareVersions(String first, String second) {
+        String[] left = normalizeVersion(first).split("\\.");
+        String[] right = normalizeVersion(second).split("\\.");
+        int length = Math.max(left.length, right.length);
+        for (int index = 0; index < length; index++) {
+            int leftValue = versionPart(left, index);
+            int rightValue = versionPart(right, index);
+            if (leftValue != rightValue) return Integer.compare(leftValue, rightValue);
+        }
+        return 0;
+    }
+
+    private int versionPart(String[] parts, int index) {
+        if (index >= parts.length) return 0;
+        try {
+            return Integer.parseInt(parts[index]);
+        } catch (NumberFormatException ignored) {
+            return 0;
+        }
+    }
+
+    private String formatReleaseNotes(String value) {
+        if (value == null) return "";
+        StringBuilder formatted = new StringBuilder();
+        for (String line : value.replace("\r", "").split("\n")) {
+            if (line.startsWith("## [")) continue;
+            String cleaned = line.startsWith("### ") ? line.substring(4) : line;
+            if (formatted.length() == 0 && cleaned.trim().isEmpty()) continue;
+            formatted.append(cleaned).append('\n');
+        }
+        return formatted.toString().trim();
     }
 
     private View deviceCard(DeviceProfile profile) {
@@ -755,6 +913,17 @@ public final class MainActivity extends ComponentActivity {
             this.name = name;
             this.baseUrl = baseUrl;
             this.pairingUrl = pairingUrl;
+        }
+    }
+
+    private static final class UpdateRelease {
+        final String version;
+        final String notes;
+        final String downloadUrl;
+        UpdateRelease(String version, String notes, String downloadUrl) {
+            this.version = version;
+            this.notes = notes;
+            this.downloadUrl = downloadUrl;
         }
     }
 }
