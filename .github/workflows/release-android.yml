@@ -50,6 +50,20 @@ jobs:
             echo "APP_VERSION_CODE=$version_code"
           } >> "$GITHUB_ENV"
 
+      - name: Prepare release notes
+        shell: bash
+        run: |
+          awk -v version="$APP_VERSION_NAME" '
+            !found && index($0, "## [" version "]") == 1 { found = 1 }
+            found && /^## \[/ && index($0, "## [" version "]") != 1 { exit }
+            found { print }
+          ' CHANGELOG.md > "$RUNNER_TEMP/release-notes.md"
+          if [[ ! -s "$RUNNER_TEMP/release-notes.md" ]]; then
+            echo "No CHANGELOG.md section found for version $APP_VERSION_NAME." >&2
+            exit 1
+          fi
+          echo "RELEASE_NOTES_PATH=$RUNNER_TEMP/release-notes.md" >> "$GITHUB_ENV"
+
       - name: Prepare release signing key
         shell: bash
         env:
@@ -90,7 +104,7 @@ jobs:
         uses: softprops/action-gh-release@v3.0.3
         with:
           name: Quota Desk Android ${{ github.ref_name }}
-          generate_release_notes: true
+          body_path: ${{ env.RELEASE_NOTES_PATH }}
           fail_on_unmatched_files: true
           files: |
             release/Quota-Desk-Android-${{ env.APP_VERSION_NAME }}.apk

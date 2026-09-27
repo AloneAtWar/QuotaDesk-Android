@@ -26,7 +26,7 @@ APK 输出位置：`app/build/outputs/apk/debug/app-debug.apk`。
 
 ## 自动发布
 
-向 GitHub 推送 `vMAJOR.MINOR.PATCH` 格式的 tag（例如 `v0.0.1`），GitHub Actions 会构建并签名 Release APK，随后创建 GitHub Release 并上传 APK 与 SHA-256 校验文件。APK 文件名为 `Quota-Desk-Android-版本号.apk`。
+向 GitHub 推送 `vMAJOR.MINOR.PATCH` 格式的 tag（例如 `v0.0.1`），GitHub Actions 会从 `CHANGELOG.md` 提取对应版本的更新记录，构建并签名 Release APK，随后创建 GitHub Release 并上传 APK 与 SHA-256 校验文件。每次发布前先在 `CHANGELOG.md` 顶部添加与 tag 版本一致的条目。APK 文件名为 `Quota-Desk-Android-版本号.apk`。
 
 仓库的 **Settings → Secrets and variables → Actions** 需要配置以下 Repository secrets：
 
