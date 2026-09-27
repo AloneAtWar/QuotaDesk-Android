@@ -1,0 +1,97 @@
+name: Android release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up JDK
+        uses: actions/setup-java@v6.0.1
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4.0.4
+        with:
+          packages: platforms;android-35 build-tools;35.0.0
+
+      - name: Read and validate release version
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "Expected a tag in vMAJOR.MINOR.PATCH form, got: $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          IFS='.' read -r major minor patch <<< "$version"
+          if (( minor > 999 || patch > 999 )); then
+            echo "MINOR and PATCH values must be at most 999 to keep versionCode increasing." >&2
+            exit 1
+          fi
+          version_code=$((52 + major * 1000000 + minor * 1000 + patch))
+          if (( version_code > 2100000000 )); then
+            echo "Calculated Android versionCode exceeds the platform limit." >&2
+            exit 1
+          fi
+          {
+            echo "APP_VERSION_NAME=$version"
+            echo "APP_VERSION_CODE=$version_code"
+          } >> "$GITHUB_ENV"
+
+      - name: Prepare release signing key
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [[ -z "$KEYSTORE_BASE64" ]]; then
+            echo "Missing repository Actions secret: ANDROID_KEYSTORE_BASE64" >&2
+            exit 1
+          fi
+          keystore_path="$RUNNER_TEMP/quotadesk-release.keystore"
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$keystore_path"
+          echo "ANDROID_KEYSTORE_PATH=$keystore_path" >> "$GITHUB_ENV"
+
+      - name: Build signed release APK
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [[ -z "$ANDROID_KEYSTORE_PASSWORD" || -z "$ANDROID_KEY_ALIAS" || -z "$ANDROID_KEY_PASSWORD" ]]; then
+            echo "Missing one or more Android signing repository Actions secrets." >&2
+            exit 1
+          fi
+          ./gradlew --no-daemon :app:assembleRelease \
+            -PappVersionName="$APP_VERSION_NAME" \
+            -PappVersionCode="$APP_VERSION_CODE"
+
+      - name: Verify APK and calculate checksum
+        run: |
+          apk="app/build/outputs/apk/release/app-release.apk"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "$apk"
+          mkdir -p release
+          output="release/Quota-Desk-Android-${APP_VERSION_NAME}.apk"
+          cp "$apk" "$output"
+          sha256sum "$output" > "$output.sha256"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3.0.3
+        with:
+          name: Quota Desk Android ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            release/Quota-Desk-Android-${{ env.APP_VERSION_NAME }}.apk
+            release/Quota-Desk-Android-${{ env.APP_VERSION_NAME }}.apk.sha256
