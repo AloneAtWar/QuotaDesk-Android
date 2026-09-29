@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 与 DownloadManager 的 setDestinationInExternalFilesDir(DIRECTORY_DOWNLOADS) 对应，仅供系统安装器读取 -->
+<paths>
+    <external-files-path name="updates" path="Download/" />
+</paths>

@@ -2,13 +2,19 @@ package com.quotadesk.mobile;
 
 import android.annotation.SuppressLint;
 import android.app.AlertDialog;
+import android.app.DownloadManager;
+import android.content.BroadcastReceiver;
+import android.content.ClipData;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
+import android.database.Cursor;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
@@ -36,6 +42,7 @@ import androidx.activity.ComponentActivity;
 import androidx.activity.OnBackPressedCallback;
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
+import androidx.core.content.FileProvider;
 import androidx.core.graphics.Insets;
 import androidx.core.view.ViewCompat;
 import androidx.core.view.WindowCompat;
@@ -47,6 +54,7 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.io.BufferedReader;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
@@ -71,6 +79,7 @@ public final class MainActivity extends ComponentActivity {
     private static final String PREF_LIGHT_THEME = "light_theme_v1";
     private static final long CONNECTION_TIMEOUT_MS = 12_000L;
     private static final String LATEST_RELEASE_API = "https://api.github.com/repos/AloneAtWar/QuotaDesk-Android/releases/latest";
+    private static final String FILE_PROVIDER_AUTHORITY = "com.quotadesk.mobile.fileprovider";
 
     private final List<DeviceProfile> devices = new ArrayList<>();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -85,6 +94,17 @@ public final class MainActivity extends ComponentActivity {
     private boolean showingDashboard;
     private boolean lightTheme;
     private boolean updateCheckInProgress;
+    private boolean activityResumed;
+    private ActivityResultLauncher<Intent> unknownSourcesLauncher;
+    private final BroadcastReceiver downloadCompleteReceiver = new BroadcastReceiver() {
+        @Override public void onReceive(Context context, Intent intent) {
+            onApkDownloadComplete(intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L));
+        }
+    };
+    private UpdateRelease pendingDownloadRelease;
+    private File activeApkFile;
+    private File pendingInstallApk;
+    private long activeApkDownloadId = -1L;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -103,6 +123,17 @@ public final class MainActivity extends ComponentActivity {
             if (result.getResultCode() != RESULT_OK || result.getData() == null) return;
             onScanResult(result.getData().getStringExtra(ScannerActivity.EXTRA_RESULT));
         });
+        unknownSourcesLauncher = registerForActivityResult(new ActivityResultContracts.StartActivityForResult(), result -> {
+            UpdateRelease release = pendingDownloadRelease;
+            pendingDownloadRelease = null;
+            if (release == null || isFinishing() || isDestroyed()) return;
+            if (android.os.Build.VERSION.SDK_INT < 26 || getPackageManager().canRequestPackageInstalls()) startApkDownload(release);
+            else toast("未开启安装权限，本次更新未开始");
+        });
+        // 系统广播，但 targetSdk 34+ 动态注册必须声明可见性；EXPORTED 保持与旧行为一致
+        IntentFilter downloadComplete = new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE);
+        if (android.os.Build.VERSION.SDK_INT >= 34) registerReceiver(downloadCompleteReceiver, downloadComplete, Context.RECEIVER_EXPORTED);
+        else registerReceiver(downloadCompleteReceiver, downloadComplete);
         loadProfiles();
         getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
             @Override public void handleOnBackPressed() {
@@ -121,17 +152,21 @@ public final class MainActivity extends ComponentActivity {
     @Override
     protected void onResume() {
         super.onResume();
+        activityResumed = true;
+        maybeInstallDownloadedApk();
         if (webView != null) webView.onResume();
     }
 
     @Override
     protected void onPause() {
+        activityResumed = false;
         if (webView != null) webView.onPause();
         super.onPause();
     }
 
     @Override
     protected void onDestroy() {
+        unregisterReceiver(downloadCompleteReceiver);
         destroyWebView();
         super.onDestroy();
     }
@@ -469,7 +504,7 @@ public final class MainActivity extends ComponentActivity {
                 .setTitle("发现新版本 " + release.version)
                 .setMessage(notes.isEmpty() ? "新版本已经可以下载。" : notes)
                 .setNegativeButton("稍后", null)
-                .setPositiveButton("下载更新", (dialog, which) -> openExternalUrl(release.downloadUrl))
+                .setPositiveButton("下载更新", (dialog, which) -> startUpdateDownload(release))
                 .show();
     }
 
@@ -479,6 +514,125 @@ public final class MainActivity extends ComponentActivity {
         } catch (Exception error) {
             toast("无法打开下载链接");
         }
+    }
+
+    private void startUpdateDownload(UpdateRelease release) {
+        if (activeApkDownloadId != -1L) {
+            toast("正在下载更新，进度见通知栏");
+            return;
+        }
+        // Android 8+ 需要用户先给本应用授予「安装未知应用」；Android 14 起部分侧载来源的应用会被系统
+        // 禁止授予该权限，所以保留「浏览器下载」作为回退路径
+        if (android.os.Build.VERSION.SDK_INT >= 26 && !getPackageManager().canRequestPackageInstalls()) {
+            pendingDownloadRelease = release;
+            new AlertDialog.Builder(this)
+                    .setTitle("允许安装应用")
+                    .setMessage("首次应用内更新需要先在系统设置中允许 Quota Desk 安装未知应用，开启后返回会自动开始下载。")
+                    .setNegativeButton("浏览器下载", (dialog, which) -> {
+                        pendingDownloadRelease = null;
+                        openExternalUrl(release.downloadUrl);
+                    })
+                    .setPositiveButton("去开启", (dialog, which) -> {
+                        try {
+                            unknownSourcesLauncher.launch(new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:" + getPackageName())));
+                        } catch (Exception error) {
+                            pendingDownloadRelease = null;
+                            openExternalUrl(release.downloadUrl);
+                        }
+                    })
+                    .show();
+            return;
+        }
+        startApkDownload(release);
+    }
+
+    private void startApkDownload(UpdateRelease release) {
+        DownloadManager manager = downloadManager();
+        File directory = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+        if (manager == null || directory == null) {
+            openExternalUrl(release.downloadUrl);
+            return;
+        }
+        // 安装包固定放在应用专属目录（全程无需存储权限）；入队前清掉旧包，避免同名冲突和目录膨胀
+        File[] staleFiles = directory.listFiles();
+        if (staleFiles != null) {
+            for (File file : staleFiles) {
+                String name = file.getName();
+                if (name.startsWith("QuotaDesk-") && name.endsWith(".apk")) file.delete();
+            }
+        }
+        activeApkFile = new File(directory, "QuotaDesk-" + release.version + ".apk");
+        DownloadManager.Request request = new DownloadManager.Request(Uri.parse(release.downloadUrl));
+        request.setTitle("Quota Desk " + release.version);
+        request.setDescription("更新安装包");
+        request.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+        request.setDestinationInExternalFilesDir(this, Environment.DIRECTORY_DOWNLOADS, activeApkFile.getName());
+        try {
+            activeApkDownloadId = manager.enqueue(request);
+            toast("开始下载 Quota Desk " + release.version + "，进度见通知栏");
+        } catch (Exception error) {
+            activeApkDownloadId = -1L;
+            activeApkFile = null;
+            openExternalUrl(release.downloadUrl);
+        }
+    }
+
+    private void onApkDownloadComplete(long downloadId) {
+        if (downloadId != activeApkDownloadId) return;
+        activeApkDownloadId = -1L;
+        File apk = activeApkFile;
+        activeApkFile = null;
+        if (apk == null || isFinishing() || isDestroyed()) return;
+        DownloadManager manager = downloadManager();
+        int status = -1;
+        int reason = 0;
+        Cursor cursor = null;
+        try {
+            cursor = manager == null ? null : manager.query(new DownloadManager.Query().setFilterById(downloadId));
+            if (cursor != null && cursor.moveToFirst()) {
+                status = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS));
+                reason = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_REASON));
+            }
+        } catch (Exception ignored) {
+        } finally {
+            if (cursor != null) cursor.close();
+        }
+        if (status != DownloadManager.STATUS_SUCCESSFUL) {
+            toast(reason == DownloadManager.ERROR_INSUFFICIENT_SPACE ? "手机存储空间不足，下载失败" : "下载失败，请稍后重试");
+            return;
+        }
+        if (!apk.exists()) {
+            toast("下载的安装包已丢失，请稍后重试");
+            return;
+        }
+        pendingInstallApk = apk;
+        maybeInstallDownloadedApk();
+    }
+
+    /**
+     * 下载完成后拉起系统安装器。若此刻应用在后台（Android 10+ 禁止后台启动 Activity），
+     * 先挂起，等 onResume 再触发。
+     */
+    private void maybeInstallDownloadedApk() {
+        File apk = pendingInstallApk;
+        if (apk == null || isFinishing() || isDestroyed()) return;
+        pendingInstallApk = null;
+        if (!apk.exists()) return;
+        // minSdk 24 起 file:// 不能跨进程共享，必须经 FileProvider 转成 content:// 并授予读权限
+        try {
+            Uri content = FileProvider.getUriForFile(this, FILE_PROVIDER_AUTHORITY, apk);
+            Intent install = new Intent(Intent.ACTION_VIEW);
+            install.setDataAndType(content, "application/vnd.android.package-archive");
+            install.setClipData(ClipData.newRawUri(null, content));
+            install.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            startActivity(install);
+        } catch (Exception error) {
+            toast("无法启动系统安装器");
+        }
+    }
+
+    private DownloadManager downloadManager() {
+        return (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
     }
 
     private String currentVersion() {
