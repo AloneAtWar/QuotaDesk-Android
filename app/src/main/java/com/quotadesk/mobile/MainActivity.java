@@ -11,6 +11,7 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.Settings;
 import android.text.InputType;
 import android.view.Gravity;
 import android.view.View;
@@ -78,6 +79,8 @@ public final class MainActivity extends ComponentActivity {
     private View webError;
     private TextView loadingLabel;
     private Runnable connectionTimeout;
+    private Runnable deviceNamePrefill;
+    private Runnable pairingCheck;
     private DeviceProfile activeProfile;
     private boolean showingDashboard;
     private boolean lightTheme;
@@ -91,8 +94,6 @@ public final class MainActivity extends ComponentActivity {
         applyNativeThemeColors();
         Window window = getWindow();
         WindowCompat.setDecorFitsSystemWindows(window, false);
-        window.setStatusBarColor(Color.TRANSPARENT);
-        window.setNavigationBarColor(Color.TRANSPARENT);
         if (android.os.Build.VERSION.SDK_INT >= 29) window.setNavigationBarContrastEnforced(false);
         WindowInsetsControllerCompat bars = WindowCompat.getInsetsController(window, window.getDecorView());
         bars.setAppearanceLightStatusBars(lightTheme);
@@ -206,15 +207,22 @@ public final class MainActivity extends ComponentActivity {
     }
 
     private void addDevice(PairingData pairing) {
+        // 先不落库：进入"待配对"状态，网页里配对成功（onPairingConfirmed）后才保存并在列表显示
         DeviceProfile profile = new DeviceProfile(pairing.name, pairing.baseUrl);
         int existing = indexOfDevice(pairing.baseUrl);
-        if (existing >= 0) {
-            profile.name = devices.get(existing).name;
-            devices.remove(existing);
-        }
-        devices.add(0, profile);
-        saveProfiles();
+        if (existing >= 0) profile.name = devices.get(existing).name;
+        profile.pendingPairing = true;
         showDashboard(profile, pairing.pairingUrl);
+    }
+
+    private void onPairingConfirmed() {
+        if (!showingDashboard || activeProfile == null || !activeProfile.pendingPairing) return;
+        activeProfile.pendingPairing = false;
+        boolean known = indexOfDevice(activeProfile.baseUrl) >= 0;
+        if (known) devices.remove(indexOfDevice(activeProfile.baseUrl));
+        devices.add(0, activeProfile);
+        saveProfiles();
+        toast(known ? "配对成功，已更新这台电脑" : "配对成功，已添加这台电脑");
     }
 
     private int indexOfDevice(String baseUrl) {
@@ -260,10 +268,19 @@ public final class MainActivity extends ComponentActivity {
         activeProfile = null;
         destroyWebView();
 
-        FrameLayout root = rootFrame();
+        // 列表内容滚动时从状态栏/小白条下方穿过：insets 加在 ScrollView 自身而非根布局，
+        // clipToPadding=false 让 padding 区域继续绘制内容
+        FrameLayout root = new FrameLayout(this);
+        root.setBackgroundColor(BG);
         ScrollView scroll = new ScrollView(this);
         scroll.setFillViewport(true);
         scroll.setClipToPadding(false);
+        ViewCompat.setOnApplyWindowInsetsListener(scroll, (view, insets) -> {
+            Insets bars = insets.getInsets(WindowInsetsCompat.Type.systemBars() | WindowInsetsCompat.Type.displayCutout());
+            view.setPadding(bars.left, bars.top, bars.right, bars.bottom);
+            return insets;
+        });
+        ViewCompat.requestApplyInsets(scroll);
         LinearLayout content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
         content.setPadding(dp(22), dp(18), dp(22), dp(28));
@@ -693,11 +710,15 @@ public final class MainActivity extends ComponentActivity {
             @Override public void onPageCommitVisible(WebView view, String url) {
                 cancelConnectionTimeout();
                 if (loadingLabel != null) loadingLabel.setVisibility(View.GONE);
+                startPairingCheck();
+                startDeviceNamePrefill();
             }
 
             @Override public void onPageFinished(WebView view, String url) {
                 cancelConnectionTimeout();
                 if (loadingLabel != null) loadingLabel.setVisibility(View.GONE);
+                startPairingCheck();
+                startDeviceNamePrefill();
             }
 
             @Override public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
@@ -781,6 +802,119 @@ public final class MainActivity extends ComponentActivity {
         connectionTimeout = null;
     }
 
+    /**
+     * 本机设备名称：系统"设备名称"（设置→关于手机）→ 蓝牙名称 → 型号码。均无需权限。
+     * 电脑端配对接口限制 60 字符，这里提前对齐。
+     */
+    private String deviceDisplayName() {
+        String name = null;
+        if (android.os.Build.VERSION.SDK_INT >= 25) {
+            try {
+                name = Settings.Global.getString(getContentResolver(), Settings.Global.DEVICE_NAME);
+            } catch (Exception ignored) { }
+        }
+        if (name == null || name.trim().isEmpty()) {
+            try {
+                name = Settings.Secure.getString(getContentResolver(), "bluetooth_name");
+            } catch (Exception ignored) { }
+        }
+        if (name == null || name.trim().isEmpty()) {
+            String model = android.os.Build.MODEL == null ? "" : android.os.Build.MODEL.trim();
+            String maker = android.os.Build.MANUFACTURER == null ? "" : android.os.Build.MANUFACTURER.trim();
+            name = !model.isEmpty() ? model : (!maker.isEmpty() ? maker : "Android 手机");
+        }
+        name = name.replaceAll("\\p{Cntrl}", " ").trim();
+        return name.length() > 60 ? name.substring(0, 60).trim() : name;
+    }
+
+    /**
+     * 配对页加载后，把本机设备名写进"设备名称"输入框作为默认值（用户仍可修改）。
+     * React 受控输入必须用原型 setter + input 事件，直接赋值会被状态还原。
+     * 只在当前值是网页端默认占位（"Android 手机"等）时写入，且只写一次；表单未挂载时重试约 10 秒。
+     */
+    private void startDeviceNamePrefill() {
+        if (deviceNamePrefill != null || webView == null || !showingDashboard) return;
+        String displayName = deviceDisplayName();
+        if (displayName.isEmpty()) return;
+        String payload;
+        try {
+            payload = new JSONObject().put("name", displayName).toString();
+        } catch (JSONException ignored) {
+            return;
+        }
+        final int[] attempts = {0};
+        deviceNamePrefill = new Runnable() {
+            @Override public void run() {
+                final Runnable self = this;
+                if (deviceNamePrefill != self || webView == null || attempts[0] >= 24) {
+                    if (deviceNamePrefill == self) deviceNamePrefill = null;
+                    return;
+                }
+                attempts[0]++;
+                webView.evaluateJavascript(pairFormPrefillScript(payload), result -> {
+                    if (deviceNamePrefill != self || webView == null) return;
+                    if ("\"retry\"".equals(result)) mainHandler.postDelayed(self, 400L);
+                    else deviceNamePrefill = null;
+                });
+            }
+        };
+        deviceNamePrefill.run();
+    }
+
+    private String pairFormPrefillScript(String payload) {
+        return "(function(payload){try{"
+                + "var input=document.getElementById('pair-device-name');"
+                + "if(!input)return 'retry';"
+                + "if(document.activeElement===input)return 'done';"
+                + "var current=(input.value||'').trim();"
+                + "if(current&&current!=='Android 手机'&&current!=='iOS 设备'&&current!=='浏览器设备')return 'done';"
+                + "var setter=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;"
+                + "if(!setter)return 'done';"
+                + "setter.call(input,payload.name);"
+                + "input.dispatchEvent(new Event('input',{bubbles:true}));"
+                + "return 'done';"
+                + "}catch(e){return 'done';}})(" + payload + ")";
+    }
+
+    /**
+     * 待配对设备的确认轮询：网页端配对成功会把只读令牌写入 localStorage；
+     * 另以"配对表单出现过又消失"作为兜底信号（防止令牌 key 变动），二者其一即视为配对完成。
+     */
+    private void startPairingCheck() {
+        if (pairingCheck != null || webView == null || !showingDashboard) return;
+        if (activeProfile == null || !activeProfile.pendingPairing) return;
+        pairingCheck = new Runnable() {
+            @Override public void run() {
+                final Runnable self = this;
+                if (pairingCheck != self || webView == null || !showingDashboard) {
+                    if (pairingCheck == self) pairingCheck = null;
+                    return;
+                }
+                if (activeProfile == null || !activeProfile.pendingPairing) {
+                    pairingCheck = null;
+                    return;
+                }
+                webView.evaluateJavascript(
+                        "(function(){try{"
+                                + "if(localStorage.getItem('quota-desk-remote-token-v1'))return 'paired';"
+                                + "var form=document.getElementById('pair-device-name');"
+                                + "if(form){window.__qdSawPairForm=true;return 'form';}"
+                                + "return window.__qdSawPairForm?'paired':'none';"
+                                + "}catch(e){return 'none';}})()",
+                        result -> {
+                            if (pairingCheck != self || webView == null) return;
+                            if ("\"paired\"".equals(result)) {
+                                pairingCheck = null;
+                                onPairingConfirmed();
+                            } else {
+                                mainHandler.postDelayed(self, 1200L);
+                            }
+                        });
+            }
+        };
+        pairingCheck.run();
+    }
+
     private boolean sameOrigin(Uri first, Uri second) {
         String firstScheme = first.getScheme();
         String secondScheme = second.getScheme();
@@ -800,6 +934,7 @@ public final class MainActivity extends ComponentActivity {
     }
 
     private void returnToDevices() {
+        if (activeProfile != null && activeProfile.pendingPairing) toast("未完成配对，这台电脑不会被保存");
         showingDashboard = false;
         destroyWebView();
         showDevices();
@@ -808,6 +943,14 @@ public final class MainActivity extends ComponentActivity {
     @SuppressLint("SetJavaScriptEnabled")
     private void destroyWebView() {
         cancelConnectionTimeout();
+        if (deviceNamePrefill != null) {
+            mainHandler.removeCallbacks(deviceNamePrefill);
+            deviceNamePrefill = null;
+        }
+        if (pairingCheck != null) {
+            mainHandler.removeCallbacks(pairingCheck);
+            pairingCheck = null;
+        }
         WebView old = webView;
         webView = null;
         loadingLabel = null;
@@ -824,8 +967,10 @@ public final class MainActivity extends ComponentActivity {
         FrameLayout frame = new FrameLayout(this);
         frame.setBackgroundColor(BG);
         ViewCompat.setOnApplyWindowInsetsListener(frame, (view, insets) -> {
-            Insets safe = insets.getInsets(WindowInsetsCompat.Type.systemBars() | WindowInsetsCompat.Type.displayCutout());
-            view.setPadding(safe.left, safe.top, safe.right, safe.bottom);
+            Insets bars = insets.getInsets(WindowInsetsCompat.Type.systemBars() | WindowInsetsCompat.Type.displayCutout());
+            // 键盘弹出时整体让位，避免网页里的输入框被 IME 遮住（API 30+ 有效）
+            int ime = insets.getInsets(WindowInsetsCompat.Type.ime()).bottom;
+            view.setPadding(bars.left, bars.top, bars.right, Math.max(bars.bottom, ime));
             return insets;
         });
         ViewCompat.requestApplyInsets(frame);
@@ -899,6 +1044,7 @@ public final class MainActivity extends ComponentActivity {
     private static final class DeviceProfile {
         String name;
         final String baseUrl;
+        boolean pendingPairing;
         DeviceProfile(String name, String baseUrl) {
             this.name = name;
             this.baseUrl = baseUrl;

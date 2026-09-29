@@ -14,6 +14,7 @@ import android.provider.Settings;
 import android.net.Uri;
 import android.view.Gravity;
 import android.view.View;
+import android.view.Window;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -26,6 +27,11 @@ import androidx.camera.core.Preview;
 import androidx.camera.lifecycle.ProcessCameraProvider;
 import androidx.camera.view.PreviewView;
 import androidx.core.content.ContextCompat;
+import androidx.core.graphics.Insets;
+import androidx.core.view.ViewCompat;
+import androidx.core.view.WindowCompat;
+import androidx.core.view.WindowInsetsCompat;
+import androidx.core.view.WindowInsetsControllerCompat;
 
 import com.google.mlkit.vision.barcode.BarcodeScanner;
 import com.google.mlkit.vision.barcode.BarcodeScannerOptions;
@@ -60,8 +66,14 @@ public final class ScannerActivity extends ComponentActivity {
         boolean light = getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(PREF_LIGHT_THEME, false);
         setTheme(light ? R.style.AppThemeLight : R.style.AppTheme);
         super.onCreate(savedInstanceState);
-        getWindow().setStatusBarColor(Color.BLACK);
-        getWindow().setNavigationBarColor(Color.BLACK);
+        // targetSdk 35 在 Android 15+ 强制边到边，setStatusBarColor/setNavigationBarColor 已失效，
+        // 相机预览铺满全屏，系统栏区域由浮层各自消费 insets
+        Window window = getWindow();
+        WindowCompat.setDecorFitsSystemWindows(window, false);
+        if (android.os.Build.VERSION.SDK_INT >= 29) window.setNavigationBarContrastEnforced(false);
+        WindowInsetsControllerCompat bars = WindowCompat.getInsetsController(window, window.getDecorView());
+        bars.setAppearanceLightStatusBars(false);
+        bars.setAppearanceLightNavigationBars(false);
         cameraExecutor = Executors.newSingleThreadExecutor();
         scanner = BarcodeScanning.getClient(new BarcodeScannerOptions.Builder()
                 .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
@@ -88,6 +100,7 @@ public final class ScannerActivity extends ComponentActivity {
         LinearLayout topBar = new LinearLayout(this);
         topBar.setGravity(Gravity.CENTER_VERTICAL);
         topBar.setPadding(dp(8), dp(3), dp(10), dp(3));
+        topBar.setMinimumHeight(dp(60));
         topBar.setBackgroundColor(0xB9000000);
         TextView back = scannerLabel("‹", 34, Color.WHITE, false);
         back.setGravity(Gravity.CENTER);
@@ -105,7 +118,7 @@ public final class ScannerActivity extends ComponentActivity {
         flashButton.setBackground(background(0x44FFFFFF, 8));
         flashButton.setOnClickListener(view -> toggleTorch());
         topBar.addView(flashButton, new LinearLayout.LayoutParams(dp(67), dp(34)));
-        root.addView(topBar, new FrameLayout.LayoutParams(-1, dp(60), Gravity.TOP));
+        root.addView(topBar, new FrameLayout.LayoutParams(-1, -2, Gravity.TOP));
 
         LinearLayout bottomPanel = new LinearLayout(this);
         bottomPanel.setGravity(Gravity.CENTER_HORIZONTAL);
@@ -139,6 +152,13 @@ public final class ScannerActivity extends ComponentActivity {
         bottomPanel.addView(zoomControls, zoomParams);
 
         root.addView(bottomPanel, new FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM));
+        ViewCompat.setOnApplyWindowInsetsListener(root, (view, insets) -> {
+            Insets safe = insets.getInsets(WindowInsetsCompat.Type.systemBars() | WindowInsetsCompat.Type.displayCutout());
+            topBar.setPadding(dp(8), dp(3) + safe.top, dp(10), dp(3));
+            bottomPanel.setPadding(dp(20), dp(13), dp(20), dp(12) + safe.bottom);
+            return insets;
+        });
+        ViewCompat.requestApplyInsets(root);
         setContentView(root);
     }
 
