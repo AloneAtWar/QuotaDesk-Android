@@ -105,6 +105,10 @@ public final class MainActivity extends ComponentActivity {
     private File activeApkFile;
     private File pendingInstallApk;
     private long activeApkDownloadId = -1L;
+    private int safeLeft;
+    private int safeTop;
+    private int safeRight;
+    private int safeBottom;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -302,6 +306,10 @@ public final class MainActivity extends ComponentActivity {
         showingDashboard = false;
         activeProfile = null;
         destroyWebView();
+        // 从网页接管的状态栏图标深浅恢复为 App 自己的主题
+        WindowInsetsControllerCompat windowBars = WindowCompat.getInsetsController(getWindow(), getWindow().getDecorView());
+        windowBars.setAppearanceLightStatusBars(lightTheme);
+        windowBars.setAppearanceLightNavigationBars(lightTheme);
 
         // 列表内容滚动时从状态栏/小白条下方穿过：insets 加在 ScrollView 自身而非根布局，
         // clipToPadding=false 让 padding 区域继续绘制内容
@@ -864,6 +872,8 @@ public final class MainActivity extends ComponentActivity {
             @Override public void onPageCommitVisible(WebView view, String url) {
                 cancelConnectionTimeout();
                 if (loadingLabel != null) loadingLabel.setVisibility(View.GONE);
+                applyWebSafeArea();
+                syncBarsAppearanceToPage();
                 startPairingCheck();
                 startDeviceNamePrefill();
             }
@@ -871,6 +881,8 @@ public final class MainActivity extends ComponentActivity {
             @Override public void onPageFinished(WebView view, String url) {
                 cancelConnectionTimeout();
                 if (loadingLabel != null) loadingLabel.setVisibility(View.GONE);
+                applyWebSafeArea();
+                syncBarsAppearanceToPage();
                 startPairingCheck();
                 startDeviceNamePrefill();
             }
@@ -1120,15 +1132,119 @@ public final class MainActivity extends ComponentActivity {
     private FrameLayout rootFrame() {
         FrameLayout frame = new FrameLayout(this);
         frame.setBackgroundColor(BG);
+        // 全屏沉浸：WebView 铺满整个屏幕（绘制到系统栏后方），系统栏/键盘的实际避让数值
+        // 换算成 CSS 像素注入网页，由页面自己留白（电脑端页面本就带 viewport-fit=cover）
         ViewCompat.setOnApplyWindowInsetsListener(frame, (view, insets) -> {
             Insets bars = insets.getInsets(WindowInsetsCompat.Type.systemBars() | WindowInsetsCompat.Type.displayCutout());
-            // 键盘弹出时整体让位，避免网页里的输入框被 IME 遮住（API 30+ 有效）
+            // 键盘弹出时的底部避让同样交给网页处理（API 30+ 有效）
             int ime = insets.getInsets(WindowInsetsCompat.Type.ime()).bottom;
-            view.setPadding(bars.left, bars.top, bars.right, Math.max(bars.bottom, ime));
+            safeLeft = bars.left;
+            safeTop = bars.top;
+            safeRight = bars.right;
+            safeBottom = Math.max(bars.bottom, ime);
+            applyWebSafeArea();
             return insets;
         });
         ViewCompat.requestApplyInsets(frame);
         return frame;
+    }
+
+    /**
+     * 把当前安全区数值注入网页：页面根容器加 padding，顶栏、设置保存条等 sticky 元素相应偏移。
+     * 页面自己的背景会铺满系统栏后方，形成单一连续表面，而不是 App 垫色的生硬条带。
+     */
+    private void applyWebSafeArea() {
+        if (webView == null) return;
+        String payload;
+        try {
+            payload = new JSONObject()
+                    .put("top", cssPx(safeTop))
+                    .put("right", cssPx(safeRight))
+                    .put("bottom", cssPx(safeBottom))
+                    .put("left", cssPx(safeLeft))
+                    .toString();
+        } catch (JSONException ignored) {
+            return;
+        }
+        webView.evaluateJavascript(webSafeAreaScript(payload), null);
+    }
+
+    private String webSafeAreaScript(String payload) {
+        return "(function(p){try{"
+                + "var style=document.getElementById('qd-safe-area');"
+                + "if(!style){style=document.createElement('style');style.id='qd-safe-area';(document.head||document.documentElement).appendChild(style);}"
+                + "style.textContent="
+                + "'.remote-app{box-sizing:border-box!important;padding:'+p.top+'px '+p.right+'px '+p.bottom+'px '+p.left+'px!important}'"
+                + "+'.remote-pair-page{box-sizing:border-box!important;padding:'+(p.top+24)+'px '+(p.right+16)+'px '+(p.bottom+24)+'px '+(p.left+16)+'px!important}'"
+                + "+'.remote-titlebar{top:'+p.top+'px!important}'"
+                + "+'.remote-settings-savebar{bottom:'+p.bottom+'px!important}'"
+                + "+'.remote-main{min-height:0!important}'"
+                + ";}catch(e){}})(" + payload + ")";
+    }
+
+    private double cssPx(int devicePx) {
+        float density = getResources().getDisplayMetrics().density;
+        return Math.round(devicePx / density * 10) / 10.0;
+    }
+
+    /**
+     * 状态栏/导航栏图标深浅跟随网页主题（读取页面 --bg 背景变量计算亮度）。
+     * 网页有独立的亮暗主题，若只按 App 主题设置图标，会出现白图标压浅色页面的问题。
+     */
+    private void syncBarsAppearanceToPage() {
+        if (webView == null) return;
+        webView.evaluateJavascript(
+                "(function(){try{return (getComputedStyle(document.documentElement).getPropertyValue('--bg')||'').trim()}catch(e){return ''}})()",
+                result -> {
+                    if (webView == null || isFinishing() || isDestroyed()) return;
+                    Boolean light = isLightColor(result);
+                    if (light == null) return;
+                    WindowInsetsControllerCompat bars = WindowCompat.getInsetsController(getWindow(), getWindow().getDecorView());
+                    bars.setAppearanceLightStatusBars(light);
+                    bars.setAppearanceLightNavigationBars(light);
+                });
+    }
+
+    /** 解析 evaluateJavascript 返回的主题色（#rgb/#rrggbb/rgb()，JSON 引号包裹），返回是否偏亮；无法解析返回 null */
+    private Boolean isLightColor(String encoded) {
+        if (encoded == null) return null;
+        String value = encoded.trim();
+        if (value.length() >= 2 && value.startsWith("\"") && value.endsWith("\"")) {
+            value = value.substring(1, value.length() - 1).trim();
+        }
+        if (value.isEmpty()) return null;
+        Integer color = null;
+        if (value.startsWith("#") && (value.length() == 7 || value.length() == 4)) {
+            try {
+                int r, g, b;
+                if (value.length() == 7) {
+                    r = Integer.parseInt(value.substring(1, 3), 16);
+                    g = Integer.parseInt(value.substring(3, 5), 16);
+                    b = Integer.parseInt(value.substring(5, 7), 16);
+                } else {
+                    r = Integer.parseInt(value.substring(1, 2), 16) * 17;
+                    g = Integer.parseInt(value.substring(2, 3), 16) * 17;
+                    b = Integer.parseInt(value.substring(3, 4), 16) * 17;
+                }
+                color = (r << 16) | (g << 8) | b;
+            } catch (NumberFormatException ignored) { }
+        } else if (value.startsWith("rgb(") && value.endsWith(")")) {
+            String[] parts = value.substring(4, value.length() - 1).split(",");
+            if (parts.length >= 3) {
+                try {
+                    int r = Integer.parseInt(parts[0].trim());
+                    int g = Integer.parseInt(parts[1].trim());
+                    String blue = parts[2].trim().replaceAll("[^0-9].*$", "");
+                    int b = blue.isEmpty() ? 0 : Integer.parseInt(blue);
+                    color = (r << 16) | (g << 8) | b;
+                } catch (NumberFormatException ignored) { }
+            }
+        }
+        if (color == null) return null;
+        int red = (color >> 16) & 0xFF;
+        int green = (color >> 8) & 0xFF;
+        int blue = color & 0xFF;
+        return (0.299 * red + 0.587 * green + 0.114 * blue) / 255.0 > 0.5;
     }
 
     private void applyNativeThemeColors() {
