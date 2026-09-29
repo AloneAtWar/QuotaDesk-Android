@@ -1173,10 +1173,15 @@ public final class MainActivity extends ComponentActivity {
         return "(function(p){try{"
                 + "var style=document.getElementById('qd-safe-area');"
                 + "if(!style){style=document.createElement('style');style.id='qd-safe-area';(document.head||document.documentElement).appendChild(style);}"
+                // 部分桌面版构建把标题栏前景写死为白色（沿用暗色窗口设计），亮色主题下会看不见；
+                // 这里用页面自己的主题变量统一规范标题栏前景/背景，亮暗主题均正确
                 + "style.textContent="
                 + "'.remote-app{box-sizing:border-box!important;padding:'+p.top+'px '+p.right+'px '+p.bottom+'px '+p.left+'px!important}'"
                 + "+'.remote-pair-page{box-sizing:border-box!important;padding:'+(p.top+24)+'px '+(p.right+16)+'px '+(p.bottom+24)+'px '+(p.left+16)+'px!important}'"
-                + "+'.remote-titlebar{top:'+p.top+'px!important}'"
+                + "+'.remote-titlebar{top:'+p.top+'px!important;color:var(--ink)!important;background:var(--titlebar-bg)!important}'"
+                + "+'.remote-titlebar .titlebar-drag b{color:var(--ink)!important}'"
+                + "+'.remote-titlebar .last-checked{color:var(--muted)!important}'"
+                + "+'.remote-titlebar button{color:var(--ink-soft)!important;border-color:var(--line)!important;background:var(--control)!important}'"
                 + "+'.remote-settings-savebar{bottom:'+p.bottom+'px!important}'"
                 + "+'.remote-main{min-height:0!important}'"
                 + ";}catch(e){}})(" + payload + ")";
