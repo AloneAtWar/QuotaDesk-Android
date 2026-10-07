@@ -90,6 +90,8 @@ public final class MainActivity extends ComponentActivity {
     private Runnable connectionTimeout;
     private Runnable deviceNamePrefill;
     private Runnable pairingCheck;
+    private Runnable pageThemeWatch;
+    private Boolean pageBarsLight;
     private DeviceProfile activeProfile;
     private boolean showingDashboard;
     private boolean lightTheme;
@@ -118,10 +120,7 @@ public final class MainActivity extends ComponentActivity {
         applyNativeThemeColors();
         Window window = getWindow();
         WindowCompat.setDecorFitsSystemWindows(window, false);
-        if (android.os.Build.VERSION.SDK_INT >= 29) window.setNavigationBarContrastEnforced(false);
-        WindowInsetsControllerCompat bars = WindowCompat.getInsetsController(window, window.getDecorView());
-        bars.setAppearanceLightStatusBars(lightTheme);
-        bars.setAppearanceLightNavigationBars(lightTheme);
+        applySystemBarsAppearance(lightTheme);
 
         scanLauncher = registerForActivityResult(new ActivityResultContracts.StartActivityForResult(), result -> {
             if (result.getResultCode() != RESULT_OK || result.getData() == null) return;
@@ -307,9 +306,8 @@ public final class MainActivity extends ComponentActivity {
         activeProfile = null;
         destroyWebView();
         // 从网页接管的状态栏图标深浅恢复为 App 自己的主题
-        WindowInsetsControllerCompat windowBars = WindowCompat.getInsetsController(getWindow(), getWindow().getDecorView());
-        windowBars.setAppearanceLightStatusBars(lightTheme);
-        windowBars.setAppearanceLightNavigationBars(lightTheme);
+        pageBarsLight = null;
+        applySystemBarsAppearance(lightTheme);
 
         // 列表内容滚动时从状态栏/小白条下方穿过：insets 加在 ScrollView 自身而非根布局，
         // clipToPadding=false 让 padding 区域继续绘制内容
@@ -828,6 +826,7 @@ public final class MainActivity extends ComponentActivity {
     private void showDashboard(DeviceProfile profile, String firstPairingUrl) {
         showingDashboard = true;
         activeProfile = profile;
+        pageBarsLight = null;
         webError = null;
         destroyWebView();
 
@@ -873,7 +872,7 @@ public final class MainActivity extends ComponentActivity {
                 cancelConnectionTimeout();
                 if (loadingLabel != null) loadingLabel.setVisibility(View.GONE);
                 applyWebSafeArea();
-                syncBarsAppearanceToPage();
+                startPageThemeWatch();
                 startPairingCheck();
                 startDeviceNamePrefill();
             }
@@ -882,7 +881,7 @@ public final class MainActivity extends ComponentActivity {
                 cancelConnectionTimeout();
                 if (loadingLabel != null) loadingLabel.setVisibility(View.GONE);
                 applyWebSafeArea();
-                syncBarsAppearanceToPage();
+                startPageThemeWatch();
                 startPairingCheck();
                 startDeviceNamePrefill();
             }
@@ -1117,6 +1116,10 @@ public final class MainActivity extends ComponentActivity {
             mainHandler.removeCallbacks(pairingCheck);
             pairingCheck = null;
         }
+        if (pageThemeWatch != null) {
+            mainHandler.removeCallbacks(pageThemeWatch);
+            pageThemeWatch = null;
+        }
         WebView old = webView;
         webView = null;
         loadingLabel = null;
@@ -1193,24 +1196,63 @@ public final class MainActivity extends ComponentActivity {
     }
 
     /**
-     * 状态栏/导航栏图标深浅跟随网页主题（读取页面 --bg 背景变量计算亮度）。
-     * 网页有独立的亮暗主题，若只按 App 主题设置图标，会出现白图标压浅色页面的问题。
+     * 统一设置状态栏/导航栏图标深浅。每次都重新关闭导航栏强制对比：部分系统在切换图标深浅后
+     * 会重新启用手势区遮罩，深色页面下底部会浮出一条刺眼的浅色横带。
      */
-    private void syncBarsAppearanceToPage() {
-        if (webView == null) return;
-        webView.evaluateJavascript(
-                "(function(){try{return (getComputedStyle(document.documentElement).getPropertyValue('--bg')||'').trim()}catch(e){return ''}})()",
-                result -> {
-                    if (webView == null || isFinishing() || isDestroyed()) return;
-                    Boolean light = isLightColor(result);
-                    if (light == null) return;
-                    WindowInsetsControllerCompat bars = WindowCompat.getInsetsController(getWindow(), getWindow().getDecorView());
-                    bars.setAppearanceLightStatusBars(light);
-                    bars.setAppearanceLightNavigationBars(light);
-                });
+    private void applySystemBarsAppearance(boolean light) {
+        Window window = getWindow();
+        if (android.os.Build.VERSION.SDK_INT >= 29) window.setNavigationBarContrastEnforced(false);
+        WindowInsetsControllerCompat bars = WindowCompat.getInsetsController(window, window.getDecorView());
+        bars.setAppearanceLightStatusBars(light);
+        bars.setAppearanceLightNavigationBars(light);
     }
 
-    /** 解析 evaluateJavascript 返回的主题色（#rgb/#rrggbb/rgb()，JSON 引号包裹），返回是否偏亮；无法解析返回 null */
+    /**
+     * 状态栏/导航栏图标深浅跟随网页主题（读取页面 --bg 背景变量计算亮度）。
+     * 网页有独立的亮暗主题且可随时在页面内切换，所以不是读一次，而是常驻监听：
+     * 仪表盘打开期间定期读取，主题一变立即切换图标深浅。
+     */
+    private void startPageThemeWatch() {
+        if (pageThemeWatch != null || webView == null || !showingDashboard) return;
+        pageThemeWatch = new Runnable() {
+            @Override public void run() {
+                final Runnable self = this;
+                if (pageThemeWatch != self || webView == null || !showingDashboard) {
+                    if (pageThemeWatch == self) pageThemeWatch = null;
+                    return;
+                }
+                webView.evaluateJavascript(
+                        "(function(){try{"
+                                // 桌面版布局的主题变量不一定定义在 :root 上（可能在 body/页面容器），
+                                // 自定义属性只向下继承，从 documentElement 读会拿到空串；
+                                // 按页面容器 → body → html 逐级回退，读不到变量再用计算后的背景色兜底
+                                + "var q=document.querySelector('.remote-app')||document.querySelector('.remote-pair-page');"
+                                + "var els=[q,document.body,document.documentElement];"
+                                + "for(var i=0;i<els.length;i++){"
+                                + "if(!els[i])continue;"
+                                + "var cs=getComputedStyle(els[i]);"
+                                + "var v=(cs.getPropertyValue('--bg')||'').trim();"
+                                + "if(v)return v;"
+                                + "v=(cs.backgroundColor||'').trim();"
+                                + "if(v&&v!=='rgba(0, 0, 0, 0)'&&v!=='transparent')return v;"
+                                + "}"
+                                + "return ''"
+                                + "}catch(e){return ''}})()",
+                        result -> {
+                            if (pageThemeWatch != self || webView == null || !showingDashboard) return;
+                            Boolean light = isLightColor(result);
+                            if (light != null && !light.equals(pageBarsLight)) {
+                                pageBarsLight = light;
+                                applySystemBarsAppearance(light);
+                            }
+                            mainHandler.postDelayed(self, 1200L);
+                        });
+            }
+        };
+        pageThemeWatch.run();
+    }
+
+    /** 解析 evaluateJavascript 返回的主题色（#rgb/#rrggbb/rgb()/rgba()，逗号或空格分隔，JSON 引号包裹），返回是否偏亮；无法解析返回 null */
     private Boolean isLightColor(String encoded) {
         if (encoded == null) return null;
         String value = encoded.trim();
@@ -1233,13 +1275,15 @@ public final class MainActivity extends ComponentActivity {
                 }
                 color = (r << 16) | (g << 8) | b;
             } catch (NumberFormatException ignored) { }
-        } else if (value.startsWith("rgb(") && value.endsWith(")")) {
-            String[] parts = value.substring(4, value.length() - 1).split(",");
+        } else if ((value.startsWith("rgb(") || value.startsWith("rgba(")) && value.endsWith(")")) {
+            // 计算后的颜色可能是 rgb(17, 25, 23) 或 rgb(17 25 23)（现代序列化用空格），rgba 还带透明度
+            String inner = value.substring(value.indexOf('(') + 1, value.length() - 1).trim();
+            String[] parts = inner.split("[,\\s]+");
             if (parts.length >= 3) {
                 try {
-                    int r = Integer.parseInt(parts[0].trim());
-                    int g = Integer.parseInt(parts[1].trim());
-                    String blue = parts[2].trim().replaceAll("[^0-9].*$", "");
+                    int r = Integer.parseInt(parts[0]);
+                    int g = Integer.parseInt(parts[1]);
+                    String blue = parts[2].replaceAll("[^0-9].*$", "");
                     int b = blue.isEmpty() ? 0 : Integer.parseInt(blue);
                     color = (r << 16) | (g << 8) | b;
                 } catch (NumberFormatException ignored) { }
