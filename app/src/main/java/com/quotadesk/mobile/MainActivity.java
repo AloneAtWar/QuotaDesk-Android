@@ -92,6 +92,7 @@ public final class MainActivity extends ComponentActivity {
     private Runnable pairingCheck;
     private Runnable pageThemeWatch;
     private Boolean pageBarsLight;
+    private boolean pendingThemeCarry;
     private DeviceProfile activeProfile;
     private boolean showingDashboard;
     private boolean lightTheme;
@@ -827,6 +828,7 @@ public final class MainActivity extends ComponentActivity {
         showingDashboard = true;
         activeProfile = profile;
         pageBarsLight = null;
+        pendingThemeCarry = true;
         webError = null;
         destroyWebView();
 
@@ -1208,9 +1210,11 @@ public final class MainActivity extends ComponentActivity {
     }
 
     /**
-     * 状态栏/导航栏图标深浅跟随网页主题（读取页面 --bg 背景变量计算亮度）。
-     * 网页有独立的亮暗主题且可随时在页面内切换，所以不是读一次，而是常驻监听：
-     * 仪表盘打开期间定期读取，主题一变立即切换图标深浅。
+     * 状态栏/导航栏图标深浅跟随网页主题，同时让深浅选择在两层界面间流转：
+     * - 进入仪表盘时先把 App 当前的深浅选择带进网页（pendingThemeCarry，只带一次）；
+     * - 之后网页里切换主题，原生主题、系统栏图标与持久化配置随之更新——
+     *   返回设备列表或直接退出 App，第一层与下次启动都沿用最后一次选择。
+     * 网页主题可随时在页面内切换，所以不是读一次，而是常驻监听。
      */
     private void startPageThemeWatch() {
         if (pageThemeWatch != null || webView == null || !showingDashboard) return;
@@ -1221,35 +1225,73 @@ public final class MainActivity extends ComponentActivity {
                     if (pageThemeWatch == self) pageThemeWatch = null;
                     return;
                 }
-                webView.evaluateJavascript(
-                        "(function(){try{"
-                                // 桌面版布局的主题变量不一定定义在 :root 上（可能在 body/页面容器），
-                                // 自定义属性只向下继承，从 documentElement 读会拿到空串；
-                                // 按页面容器 → body → html 逐级回退，读不到变量再用计算后的背景色兜底
-                                + "var q=document.querySelector('.remote-app')||document.querySelector('.remote-pair-page');"
-                                + "var els=[q,document.body,document.documentElement];"
-                                + "for(var i=0;i<els.length;i++){"
-                                + "if(!els[i])continue;"
-                                + "var cs=getComputedStyle(els[i]);"
-                                + "var v=(cs.getPropertyValue('--bg')||'').trim();"
-                                + "if(v)return v;"
-                                + "v=(cs.backgroundColor||'').trim();"
-                                + "if(v&&v!=='rgba(0, 0, 0, 0)'&&v!=='transparent')return v;"
-                                + "}"
-                                + "return ''"
-                                + "}catch(e){return ''}})()",
-                        result -> {
-                            if (pageThemeWatch != self || webView == null || !showingDashboard) return;
-                            Boolean light = isLightColor(result);
-                            if (light != null && !light.equals(pageBarsLight)) {
-                                pageBarsLight = light;
-                                applySystemBarsAppearance(light);
-                            }
-                            mainHandler.postDelayed(self, 1200L);
-                        });
+                webView.evaluateJavascript(pageThemeScript(), result -> {
+                    if (pageThemeWatch != self || webView == null || !showingDashboard) return;
+                    Boolean light = pageThemeLight(result);
+                    if (light == null) {
+                        mainHandler.postDelayed(self, 1200L);
+                        return;
+                    }
+                    if (pendingThemeCarry) {
+                        pendingThemeCarry = false;
+                        if (light != lightTheme) {
+                            // 网页主题与 App 不一致：点一次网页自己的主题切换按钮，React 状态
+                            // 与 localStorage 由页面自行更新，稍后尽快复查翻转结果再继续记录
+                            webView.evaluateJavascript(
+                                    "(function(){try{var b=document.querySelector('.remote-title-theme')||document.querySelector('.remote-pair-theme');if(b)b.click();}catch(e){}})()",
+                                    null);
+                            mainHandler.postDelayed(self, 400L);
+                            return;
+                        }
+                    }
+                    if (!light.equals(pageBarsLight)) {
+                        pageBarsLight = light;
+                        applySystemBarsAppearance(light);
+                    }
+                    if (lightTheme != light) {
+                        lightTheme = light;
+                        applyNativeThemeColors();
+                        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(PREF_LIGHT_THEME, light).apply();
+                    }
+                    mainHandler.postDelayed(self, 1200L);
+                });
             }
         };
         pageThemeWatch.run();
+    }
+
+    /** 读取网页当前主题：优先 html 的 data-theme（页面自己维护），旧版页面回退到 --bg/背景色亮度 */
+    private String pageThemeScript() {
+        return "(function(){try{"
+                + "var t=document.documentElement.dataset?(document.documentElement.dataset.theme||''):'';"
+                + "if(t==='dark'||t==='light')return t;"
+                // 桌面版布局的主题变量不一定定义在 :root 上（可能在 body/页面容器），
+                // 自定义属性只向下继承，从 documentElement 读会拿到空串；
+                // 按页面容器 → body → html 逐级回退，读不到变量再用计算后的背景色兜底
+                + "var q=document.querySelector('.remote-app')||document.querySelector('.remote-pair-page');"
+                + "var els=[q,document.body,document.documentElement];"
+                + "for(var i=0;i<els.length;i++){"
+                + "if(!els[i])continue;"
+                + "var cs=getComputedStyle(els[i]);"
+                + "var v=(cs.getPropertyValue('--bg')||'').trim();"
+                + "if(v)return v;"
+                + "v=(cs.backgroundColor||'').trim();"
+                + "if(v&&v!=='rgba(0, 0, 0, 0)'&&v!=='transparent')return v;"
+                + "}"
+                + "return ''"
+                + "}catch(e){return ''}})()";
+    }
+
+    /** 解析 pageThemeScript 的返回值：data-theme 直接给出 dark/light，否则按颜色亮度判断 */
+    private Boolean pageThemeLight(String encoded) {
+        if (encoded == null) return null;
+        String value = encoded.trim();
+        if (value.length() >= 2 && value.startsWith("\"") && value.endsWith("\"")) {
+            value = value.substring(1, value.length() - 1).trim();
+        }
+        if ("light".equals(value)) return true;
+        if ("dark".equals(value)) return false;
+        return isLightColor(encoded);
     }
 
     /** 解析 evaluateJavascript 返回的主题色（#rgb/#rrggbb/rgb()/rgba()，逗号或空格分隔，JSON 引号包裹），返回是否偏亮；无法解析返回 null */
