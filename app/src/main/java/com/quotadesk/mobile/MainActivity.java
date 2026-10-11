@@ -909,7 +909,15 @@ public final class MainActivity extends ComponentActivity {
         loadingLabel.setBackgroundColor(BG);
         root.addView(loadingLabel, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         setContentView(root);
-        webView.loadUrl(firstPairingUrl == null ? profile.baseUrl : firstPairingUrl);
+        webView.loadUrl(appendThemeParam(firstPairingUrl == null ? profile.baseUrl : firstPairingUrl));
+    }
+
+    /**
+     * 把 App 当前的深浅主题拼进远程页链接(#theme=light|dark):v0.5.9+ 的远程页启动时直接读取应用,
+     * 避免进入后再翻转闪烁;旧版页面忽略该参数,仍由 startPageThemeWatch 的模拟点击兜底校正。
+     */
+    private String appendThemeParam(String url) {
+        return url + (url.contains("#") ? "&" : "#") + "theme=" + (lightTheme ? "light" : "dark");
     }
 
     private void showWebFailure(String message) {
@@ -1186,7 +1194,10 @@ public final class MainActivity extends ComponentActivity {
                 + "+'.remote-titlebar{top:'+p.top+'px!important;color:var(--ink)!important;background:var(--titlebar-bg)!important}'"
                 + "+'.remote-titlebar .titlebar-drag b{color:var(--ink)!important}'"
                 + "+'.remote-titlebar .last-checked{color:var(--muted)!important}'"
-                + "+'.remote-titlebar button{color:var(--ink-soft)!important;border-color:var(--line)!important;background:var(--control)!important}'"
+                // 只规范标题栏的图标按钮(直接子按钮与 .control-solo),不能笼统匹配 .remote-titlebar button——
+                // 视图菜单(.main-view-menu)与全屏透明遮罩(.main-view-menu-dismiss)也在标题栏里,
+                // 笼统匹配会把遮罩刷成不透明背景,菜单打开时下方内容全被盖住
+                + "+'.remote-titlebar .titlebar-controls>button,.remote-titlebar .titlebar-actions>button,.remote-titlebar .control-solo{color:var(--ink-soft)!important;border-color:var(--line)!important;background:var(--control)!important}'"
                 + "+'.remote-settings-savebar{bottom:'+p.bottom+'px!important}'"
                 + "+'.remote-main{min-height:0!important}'"
                 + ";}catch(e){}})(" + payload + ")";
