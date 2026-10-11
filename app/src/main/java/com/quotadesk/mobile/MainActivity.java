@@ -1196,8 +1196,10 @@ public final class MainActivity extends ComponentActivity {
                 + "+'.remote-titlebar .last-checked{color:var(--muted)!important}'"
                 // 只规范标题栏的图标按钮(直接子按钮与 .control-solo),不能笼统匹配 .remote-titlebar button——
                 // 视图菜单(.main-view-menu)与全屏透明遮罩(.main-view-menu-dismiss)也在标题栏里,
-                // 笼统匹配会把遮罩刷成不透明背景,菜单打开时下方内容全被盖住
-                + "+'.remote-titlebar .titlebar-controls>button,.remote-titlebar .titlebar-actions>button,.remote-titlebar .control-solo{color:var(--ink-soft)!important;border-color:var(--line)!important;background:var(--control)!important}'"
+                // 命中遮罩会把它刷成不透明背景,菜单打开时下方内容全被盖住。
+                // 桌面端 0.5.10 起遮罩已改为 div(天然免疫 button 选择器),
+                // 这里再加 :not() 兜底,兼容尚未升级的桌面端页面
+                + "+'.remote-titlebar .titlebar-controls>button:not(.main-view-menu-dismiss),.remote-titlebar .titlebar-actions>button:not(.main-view-menu-dismiss),.remote-titlebar .control-solo{color:var(--ink-soft)!important;border-color:var(--line)!important;background:var(--control)!important}'"
                 + "+'.remote-settings-savebar{bottom:'+p.bottom+'px!important}'"
                 + "+'.remote-main{min-height:0!important}'"
                 + ";}catch(e){}})(" + payload + ")";
