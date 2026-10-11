@@ -1246,16 +1246,28 @@ public final class MainActivity extends ComponentActivity {
                         return;
                     }
                     if (pendingThemeCarry) {
-                        pendingThemeCarry = false;
                         if (light != lightTheme) {
-                            // 网页主题与 App 不一致：点一次网页自己的主题切换按钮，React 状态
-                            // 与 localStorage 由页面自行更新，稍后尽快复查翻转结果再继续记录
+                            // 网页主题与 App 不一致：v0.5.11+ 的页面暴露了 __qdSetTheme,直接走
+                            // React 状态校正(localStorage 与 data-theme 由页面 effect 一并更新);
+                            // 旧版页面回退到点一次页面自己的主题切换按钮。校正成功才消耗
+                            // pendingThemeCarry,页面尚未渲染出按钮时下一拍重试
                             webView.evaluateJavascript(
-                                    "(function(){try{var b=document.querySelector('.remote-title-theme')||document.querySelector('.remote-pair-theme');if(b)b.click();}catch(e){}})()",
-                                    null);
-                            mainHandler.postDelayed(self, 400L);
+                                    "(function(t){try{if(window.__qdSetTheme){window.__qdSetTheme(t);return '1';}"
+                                            + "var b=document.querySelector('.remote-title-theme')||document.querySelector('.remote-pair-theme');"
+                                            + "if(b){b.click();return '1';}return '0';}catch(e){return '0';}})("
+                                            + (lightTheme ? "'light'" : "'dark'") + ")",
+                                    carried -> {
+                                        if (pageThemeWatch != self || webView == null || !showingDashboard) return;
+                                        if ("\"1\"".equals(carried)) {
+                                            pendingThemeCarry = false;
+                                            mainHandler.postDelayed(self, 400L);
+                                        } else {
+                                            mainHandler.postDelayed(self, 1200L);
+                                        }
+                                    });
                             return;
                         }
+                        pendingThemeCarry = false;
                     }
                     if (!light.equals(pageBarsLight)) {
                         pageBarsLight = light;
@@ -1278,10 +1290,13 @@ public final class MainActivity extends ComponentActivity {
         return "(function(){try{"
                 + "var t=document.documentElement.dataset?(document.documentElement.dataset.theme||''):'';"
                 + "if(t==='dark'||t==='light')return t;"
+                // 页面容器还没挂载(React 尚未渲染)时,body 上读到的是样式表默认暗色,
+                // 会被误判成"页面选择了暗色"并触发错误的纠正翻转——此时返回未知,等下一拍再读
+                + "var q=document.querySelector('.remote-app')||document.querySelector('.remote-pair-page');"
+                + "if(!q)return '';"
                 // 桌面版布局的主题变量不一定定义在 :root 上（可能在 body/页面容器），
                 // 自定义属性只向下继承，从 documentElement 读会拿到空串；
                 // 按页面容器 → body → html 逐级回退，读不到变量再用计算后的背景色兜底
-                + "var q=document.querySelector('.remote-app')||document.querySelector('.remote-pair-page');"
                 + "var els=[q,document.body,document.documentElement];"
                 + "for(var i=0;i<els.length;i++){"
                 + "if(!els[i])continue;"
