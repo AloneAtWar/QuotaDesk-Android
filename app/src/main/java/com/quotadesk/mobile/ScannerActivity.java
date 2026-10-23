@@ -63,7 +63,9 @@ public final class ScannerActivity extends ComponentActivity {
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
-        boolean light = getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(PREF_LIGHT_THEME, false);
+        android.content.SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        String policy = prefs.getString("native_appearance_v2", prefs.getBoolean(PREF_LIGHT_THEME, false) ? "light" : "dark");
+        boolean light = "light".equals(policy) || ("system".equals(policy) && (getResources().getConfiguration().uiMode & android.content.res.Configuration.UI_MODE_NIGHT_MASK) != android.content.res.Configuration.UI_MODE_NIGHT_YES);
         setTheme(light ? R.style.AppThemeLight : R.style.AppTheme);
         super.onCreate(savedInstanceState);
         // targetSdk 35 在 Android 15+ 强制边到边，setStatusBarColor/setNavigationBarColor 已失效，

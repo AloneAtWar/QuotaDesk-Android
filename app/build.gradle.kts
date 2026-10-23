@@ -40,16 +40,22 @@ android {
 
     buildTypes {
         getByName("release") {
-            check(hasReleaseSigning) {
-                "Set ANDROID_KEYSTORE_PATH, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, and ANDROID_KEY_PASSWORD to build a signed release APK."
-            }
-            signingConfig = signingConfigs.getByName("release")
+            if (hasReleaseSigning) signingConfig = signingConfigs.getByName("release")
         }
     }
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+    }
+}
+
+// Debug builds must work without access to production signing keys.
+gradle.taskGraph.whenReady {
+    if (allTasks.any { it.project == project && it.name.contains("Release") }) {
+        check(hasReleaseSigning) {
+            "Set ANDROID_KEYSTORE_PATH, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, and ANDROID_KEY_PASSWORD to build a signed release APK."
+        }
     }
 }
 

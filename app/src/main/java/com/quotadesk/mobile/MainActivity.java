@@ -92,7 +92,7 @@ public final class MainActivity extends ComponentActivity {
     private Runnable pairingCheck;
     private Runnable pageThemeWatch;
     private Boolean pageBarsLight;
-    private boolean pendingThemeCarry;
+    private Boolean pageNavigationBarsLight;
     private DeviceProfile activeProfile;
     private boolean showingDashboard;
     private boolean lightTheme;
@@ -115,7 +115,10 @@ public final class MainActivity extends ComponentActivity {
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
-        lightTheme = getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(PREF_LIGHT_THEME, false);
+        android.content.SharedPreferences appearancePrefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        String appearance = appearancePrefs.getString("native_appearance_v2", appearancePrefs.contains(PREF_LIGHT_THEME) ? (appearancePrefs.getBoolean(PREF_LIGHT_THEME, false) ? "light" : "dark") : "system");
+        lightTheme = "light".equals(appearance) || ("system".equals(appearance) && (getResources().getConfiguration().uiMode & android.content.res.Configuration.UI_MODE_NIGHT_MASK) != android.content.res.Configuration.UI_MODE_NIGHT_YES);
+        appearancePrefs.edit().putString("native_appearance_v2", appearance).putBoolean(PREF_LIGHT_THEME, lightTheme).apply();
         setTheme(lightTheme ? R.style.AppThemeLight : R.style.AppTheme);
         super.onCreate(savedInstanceState);
         applyNativeThemeColors();
@@ -308,6 +311,7 @@ public final class MainActivity extends ComponentActivity {
         destroyWebView();
         // 从网页接管的状态栏图标深浅恢复为 App 自己的主题
         pageBarsLight = null;
+        pageNavigationBarsLight = null;
         applySystemBarsAppearance(lightTheme);
 
         // 列表内容滚动时从状态栏/小白条下方穿过：insets 加在 ScrollView 自身而非根布局，
@@ -347,15 +351,22 @@ public final class MainActivity extends ComponentActivity {
         brand.addView(badge);
         TextView themeButton = label(lightTheme ? "☀" : "☾", 17, INK, true);
         themeButton.setGravity(Gravity.CENTER);
-        themeButton.setContentDescription(lightTheme ? "切换暗色主题" : "切换亮色主题");
+        themeButton.setContentDescription("设备列表外观");
         themeButton.setBackground(round(SURFACE, 10, BORDER, 1));
         LinearLayout.LayoutParams themeParams = new LinearLayout.LayoutParams(dp(36), dp(36));
         themeParams.leftMargin = dp(8);
         brand.addView(themeButton, themeParams);
         themeButton.setOnClickListener(view -> {
-            lightTheme = !lightTheme;
-            getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(PREF_LIGHT_THEME, lightTheme).apply();
-            recreate();
+            android.content.SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+            String policy = prefs.getString("native_appearance_v2", lightTheme ? "light" : "dark");
+            String[] values = {"system", "light", "dark"};
+            int checked = "system".equals(policy) ? 0 : "light".equals(policy) ? 1 : 2;
+            new android.app.AlertDialog.Builder(this).setTitle("设备列表外观")
+                    .setSingleChoiceItems(new String[]{"跟随系统", "亮色", "暗色"}, checked, (dialog, which) -> {
+                        prefs.edit().putString("native_appearance_v2", values[which]).apply();
+                        dialog.dismiss();
+                        recreate();
+                    }).setNegativeButton("取消", null).show();
         });
         content.addView(brand);
 
@@ -828,7 +839,6 @@ public final class MainActivity extends ComponentActivity {
         showingDashboard = true;
         activeProfile = profile;
         pageBarsLight = null;
-        pendingThemeCarry = true;
         webError = null;
         destroyWebView();
 
@@ -909,16 +919,9 @@ public final class MainActivity extends ComponentActivity {
         loadingLabel.setBackgroundColor(BG);
         root.addView(loadingLabel, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         setContentView(root);
-        webView.loadUrl(appendThemeParam(firstPairingUrl == null ? profile.baseUrl : firstPairingUrl));
+        webView.loadUrl(firstPairingUrl == null ? profile.baseUrl : firstPairingUrl);
     }
 
-    /**
-     * 把 App 当前的深浅主题拼进远程页链接(#theme=light|dark):v0.5.9+ 的远程页启动时直接读取应用,
-     * 避免进入后再翻转闪烁;旧版页面忽略该参数,仍由 startPageThemeWatch 的模拟点击兜底校正。
-     */
-    private String appendThemeParam(String url) {
-        return url + (url.contains("#") ? "&" : "#") + "theme=" + (lightTheme ? "light" : "dark");
-    }
 
     private void showWebFailure(String message) {
         if (!showingDashboard || webView == null) return;
@@ -1186,20 +1189,12 @@ public final class MainActivity extends ComponentActivity {
         return "(function(p){try{"
                 + "var style=document.getElementById('qd-safe-area');"
                 + "if(!style){style=document.createElement('style');style.id='qd-safe-area';(document.head||document.documentElement).appendChild(style);}"
-                // 部分桌面版构建把标题栏前景写死为白色（沿用暗色窗口设计），亮色主题下会看不见；
-                // 这里用页面自己的主题变量统一规范标题栏前景/背景，亮暗主题均正确
+                // Only adapt geometry. The webpage owns all theme styling.
                 + "style.textContent="
                 + "'.remote-app{box-sizing:border-box!important;padding:'+p.top+'px '+p.right+'px '+p.bottom+'px '+p.left+'px!important}'"
                 + "+'.remote-pair-page{box-sizing:border-box!important;padding:'+(p.top+24)+'px '+(p.right+16)+'px '+(p.bottom+24)+'px '+(p.left+16)+'px!important}'"
-                + "+'.remote-titlebar{top:'+p.top+'px!important;color:var(--ink)!important;background:var(--titlebar-bg)!important}'"
-                + "+'.remote-titlebar .titlebar-drag b{color:var(--ink)!important}'"
-                + "+'.remote-titlebar .last-checked{color:var(--muted)!important}'"
-                // 只规范标题栏的图标按钮(直接子按钮与 .control-solo),不能笼统匹配 .remote-titlebar button——
-                // 视图菜单(.main-view-menu)与全屏透明遮罩(.main-view-menu-dismiss)也在标题栏里,
-                // 命中遮罩会把它刷成不透明背景,菜单打开时下方内容全被盖住。
-                // 桌面端 0.5.10 起遮罩已改为 div(天然免疫 button 选择器),
-                // 这里再加 :not() 兜底,兼容尚未升级的桌面端页面
-                + "+'.remote-titlebar .titlebar-controls>button:not(.main-view-menu-dismiss),.remote-titlebar .titlebar-actions>button:not(.main-view-menu-dismiss),.remote-titlebar .control-solo{color:var(--ink-soft)!important;border-color:var(--line)!important;background:var(--control)!important}'"
+                + "+'.remote-titlebar{top:'+p.top+'px!important}'"
+                + "+'.remote-app:before{content:attr(data-qd-safe-area);position:fixed;z-index:40;top:0;left:0;right:0;height:'+p.top+'px;background:var(--titlebar-bg);pointer-events:none}'"
                 + "+'.remote-settings-savebar{bottom:'+p.bottom+'px!important}'"
                 + "+'.remote-main{min-height:0!important}'"
                 + ";}catch(e){}})(" + payload + ")";
@@ -1215,20 +1210,19 @@ public final class MainActivity extends ComponentActivity {
      * 会重新启用手势区遮罩，深色页面下底部会浮出一条刺眼的浅色横带。
      */
     private void applySystemBarsAppearance(boolean light) {
+        applySystemBarsAppearance(light, light);
+    }
+
+    private void applySystemBarsAppearance(boolean statusLight, boolean navigationLight) {
         Window window = getWindow();
         if (android.os.Build.VERSION.SDK_INT >= 29) window.setNavigationBarContrastEnforced(false);
         WindowInsetsControllerCompat bars = WindowCompat.getInsetsController(window, window.getDecorView());
-        bars.setAppearanceLightStatusBars(light);
-        bars.setAppearanceLightNavigationBars(light);
+        bars.setAppearanceLightStatusBars(statusLight);
+        bars.setAppearanceLightNavigationBars(navigationLight);
     }
 
-    /**
-     * 状态栏/导航栏图标深浅跟随网页主题，同时让深浅选择在两层界面间流转：
-     * - 进入仪表盘时先把 App 当前的深浅选择带进网页（pendingThemeCarry，只带一次）；
-     * - 之后网页里切换主题，原生主题、系统栏图标与持久化配置随之更新——
-     *   返回设备列表或直接退出 App，第一层与下次启动都沿用最后一次选择。
-     * 网页主题可随时在页面内切换，所以不是读一次，而是常驻监听。
-     */
+    /** The webpage owns its theme. Only the visible system-bar icons follow its
+     * resolved light/dark mode; native preferences remain independent. */
     private void startPageThemeWatch() {
         if (pageThemeWatch != null || webView == null || !showingDashboard) return;
         pageThemeWatch = new Runnable() {
@@ -1240,43 +1234,20 @@ public final class MainActivity extends ComponentActivity {
                 }
                 webView.evaluateJavascript(pageThemeScript(), result -> {
                     if (pageThemeWatch != self || webView == null || !showingDashboard) return;
-                    Boolean light = pageThemeLight(result);
+                    String decoded = result == null ? "" : result.trim();
+                    if (decoded.startsWith("\"") && decoded.endsWith("\"")) decoded = decoded.substring(1, decoded.length() - 1);
+                    String[] colors = decoded.split("\\|", 2);
+                    Boolean light = pageThemeLight(colors[0]);
+                    Boolean navigationLight = colors.length > 1 ? pageThemeLight(colors[1]) : light;
                     if (light == null) {
                         mainHandler.postDelayed(self, 1200L);
                         return;
                     }
-                    if (pendingThemeCarry) {
-                        if (light != lightTheme) {
-                            // 网页主题与 App 不一致：v0.5.11+ 的页面暴露了 __qdSetTheme,直接走
-                            // React 状态校正(localStorage 与 data-theme 由页面 effect 一并更新);
-                            // 旧版页面回退到点一次页面自己的主题切换按钮。校正成功才消耗
-                            // pendingThemeCarry,页面尚未渲染出按钮时下一拍重试
-                            webView.evaluateJavascript(
-                                    "(function(t){try{if(window.__qdSetTheme){window.__qdSetTheme(t);return '1';}"
-                                            + "var b=document.querySelector('.remote-title-theme')||document.querySelector('.remote-pair-theme');"
-                                            + "if(b){b.click();return '1';}return '0';}catch(e){return '0';}})("
-                                            + (lightTheme ? "'light'" : "'dark'") + ")",
-                                    carried -> {
-                                        if (pageThemeWatch != self || webView == null || !showingDashboard) return;
-                                        if ("\"1\"".equals(carried)) {
-                                            pendingThemeCarry = false;
-                                            mainHandler.postDelayed(self, 400L);
-                                        } else {
-                                            mainHandler.postDelayed(self, 1200L);
-                                        }
-                                    });
-                            return;
-                        }
-                        pendingThemeCarry = false;
-                    }
-                    if (!light.equals(pageBarsLight)) {
+                    if (navigationLight == null) navigationLight = light;
+                    if (!light.equals(pageBarsLight) || !navigationLight.equals(pageNavigationBarsLight)) {
                         pageBarsLight = light;
-                        applySystemBarsAppearance(light);
-                    }
-                    if (lightTheme != light) {
-                        lightTheme = light;
-                        applyNativeThemeColors();
-                        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(PREF_LIGHT_THEME, light).apply();
+                        pageNavigationBarsLight = navigationLight;
+                        applySystemBarsAppearance(light, navigationLight);
                     }
                     mainHandler.postDelayed(self, 1200L);
                 });
@@ -1288,11 +1259,12 @@ public final class MainActivity extends ComponentActivity {
     /** 读取网页当前主题：优先 html 的 data-theme（页面自己维护），旧版页面回退到 --bg/背景色亮度 */
     private String pageThemeScript() {
         return "(function(){try{"
+                + "var q=document.querySelector('.remote-app')||document.querySelector('.remote-pair-page');"
+                + "if(q&&document.documentElement.dataset.themeSelection){var cs=getComputedStyle(q);var bg=(cs.getPropertyValue('--bg')||'').trim();var bar=document.querySelector('.remote-titlebar');var top=bar?getComputedStyle(bar).backgroundColor:bg;if(bg&&top)return top+'|'+bg;}"
                 + "var t=document.documentElement.dataset?(document.documentElement.dataset.theme||''):'';"
                 + "if(t==='dark'||t==='light')return t;"
                 // 页面容器还没挂载(React 尚未渲染)时,body 上读到的是样式表默认暗色,
                 // 会被误判成"页面选择了暗色"并触发错误的纠正翻转——此时返回未知,等下一拍再读
-                + "var q=document.querySelector('.remote-app')||document.querySelector('.remote-pair-page');"
                 + "if(!q)return '';"
                 // 桌面版布局的主题变量不一定定义在 :root 上（可能在 body/页面容器），
                 // 自定义属性只向下继承，从 documentElement 读会拿到空串；
