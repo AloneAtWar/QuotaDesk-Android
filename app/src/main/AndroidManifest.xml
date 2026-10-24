@@ -3,6 +3,16 @@
     <uses-permission android:name="android.permission.CAMERA" />
     <!-- 应用内下载更新安装包后拉起系统安装器所需；未声明时 Android 8+ 会直接拒绝安装 -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- 超级岛：Android 13+ 通知运行时权限 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 超级岛：Android 16+ 原生实时活动(Live Updates)上岛所需；HyperOS 3 对第三方焦点通知
+         静默失效时的备用渲染路径（小米路径 + 原生路径双信号并存） -->
+    <uses-permission android:name="android.permission.POST_PROMOTED_NOTIFICATIONS" />
+    <!-- 超级岛：前台服务常驻轮询电脑端额度 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- 超级岛：开机自恢复监控 -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
 
     <application
@@ -26,6 +36,35 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- 超级岛额度监控前台服务：轮询电脑端快照并以焦点通知形式刷新超级岛 -->
+        <service
+            android:name=".QuotaIslandService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="quota_island_poller" />
+        </service>
+
+        <!-- 开机（或应用自更新）后恢复已开启的超级岛监控 -->
+        <receiver
+            android:name=".IslandBootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Shizuku 支持：以 adb/root 特权调用隐藏接口所必需 -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:enabled="true"
+            android:exported="true"
+            android:multiprocess="false"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
 
         <!-- 把应用专属目录里的更新安装包以 content:// 暴露给系统安装器 -->
         <provider

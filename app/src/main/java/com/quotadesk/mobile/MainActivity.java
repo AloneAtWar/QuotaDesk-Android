@@ -1,5 +1,6 @@
 package com.quotadesk.mobile;
 
+import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.AlertDialog;
 import android.app.DownloadManager;
@@ -8,6 +9,7 @@ import android.content.ClipData;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.graphics.Color;
 import android.graphics.Typeface;
@@ -65,6 +67,8 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 
+import rikka.shizuku.Shizuku;
+
 public final class MainActivity extends ComponentActivity {
     private int BG;
     private int SURFACE;
@@ -113,6 +117,21 @@ public final class MainActivity extends ComponentActivity {
     private int safeRight;
     private int safeBottom;
 
+    // ---- 超级岛（澎湃OS 焦点通知） ----
+    private static final int REQUEST_SHIZUKU = 4101;
+    private ActivityResultLauncher<String> notifPermissionLauncher;
+    private AlertDialog islandDialog;
+    /** 扫码目标：true = 给超级岛绑定电脑，false = 走原有的添加设备流程 */
+    private boolean scanForIsland;
+    private final Shizuku.OnRequestPermissionResultListener shizukuPermissionListener = (requestCode, grantResult) -> {
+        if (requestCode == REQUEST_SHIZUKU && grantResult == PackageManager.PERMISSION_GRANTED) {
+            toast("Shizuku 已授权");
+        } else if (requestCode == REQUEST_SHIZUKU) {
+            toast("未授予 Shizuku 权限，焦点通知可能被白名单拦截");
+        }
+        reopenIslandDialog();
+    };
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         lightTheme = getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(PREF_LIGHT_THEME, false);
@@ -124,7 +143,11 @@ public final class MainActivity extends ComponentActivity {
         applySystemBarsAppearance(lightTheme);
 
         scanLauncher = registerForActivityResult(new ActivityResultContracts.StartActivityForResult(), result -> {
-            if (result.getResultCode() != RESULT_OK || result.getData() == null) return;
+            if (result.getResultCode() != RESULT_OK || result.getData() == null) {
+                // 取消扫码时复位目标，避免下次"添加设备"的扫码被误路由给超级岛
+                scanForIsland = false;
+                return;
+            }
             onScanResult(result.getData().getStringExtra(ScannerActivity.EXTRA_RESULT));
         });
         unknownSourcesLauncher = registerForActivityResult(new ActivityResultContracts.StartActivityForResult(), result -> {
@@ -134,6 +157,14 @@ public final class MainActivity extends ComponentActivity {
             if (android.os.Build.VERSION.SDK_INT < 26 || getPackageManager().canRequestPackageInstalls()) startApkDownload(release);
             else toast("未开启安装权限，本次更新未开始");
         });
+        notifPermissionLauncher = registerForActivityResult(new ActivityResultContracts.RequestPermission(), granted -> {
+            toast(Boolean.TRUE.equals(granted) ? "通知权限已开启" : "没有通知权限，超级岛内容无法显示");
+            reopenIslandDialog();
+        });
+        try {
+            Shizuku.addRequestPermissionResultListener(shizukuPermissionListener);
+        } catch (Throwable ignored) {
+        }
         // 系统广播，但 targetSdk 34+ 动态注册必须声明可见性；EXPORTED 保持与旧行为一致
         IntentFilter downloadComplete = new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE);
         if (android.os.Build.VERSION.SDK_INT >= 34) registerReceiver(downloadCompleteReceiver, downloadComplete, Context.RECEIVER_EXPORTED);
@@ -170,6 +201,10 @@ public final class MainActivity extends ComponentActivity {
 
     @Override
     protected void onDestroy() {
+        try {
+            Shizuku.removeRequestPermissionResultListener(shizukuPermissionListener);
+        } catch (Throwable ignored) {
+        }
         unregisterReceiver(downloadCompleteReceiver);
         destroyWebView();
         super.onDestroy();
@@ -178,7 +213,13 @@ public final class MainActivity extends ComponentActivity {
     private void onScanResult(String contents) {
         if (contents == null) return;
         try {
-            addDevice(parsePairingLink(contents));
+            PairingData pairing = parsePairingLink(contents);
+            if (scanForIsland) {
+                scanForIsland = false;
+                applyIslandPairing(pairing);
+                return;
+            }
+            addDevice(pairing);
         } catch (IllegalArgumentException error) {
             toast(error.getMessage());
         }
@@ -211,7 +252,7 @@ public final class MainActivity extends ComponentActivity {
         }
         String baseUrl = uri.buildUpon().encodedFragment(null).build().toString();
         String name = host + (uri.getPort() == -1 ? "" : ":" + uri.getPort());
-        return new PairingData(name, baseUrl, uri.toString());
+        return new PairingData(name, baseUrl, uri.toString(), token.trim());
     }
 
     private String accessToken(String encodedFragment) {
@@ -249,9 +290,32 @@ public final class MainActivity extends ComponentActivity {
         // 先不落库：进入"待配对"状态，网页里配对成功（onPairingConfirmed）后才保存并在列表显示
         DeviceProfile profile = new DeviceProfile(pairing.name, pairing.baseUrl);
         int existing = indexOfDevice(pairing.baseUrl);
-        if (existing >= 0) profile.name = devices.get(existing).name;
+        if (existing >= 0) {
+            profile.name = devices.get(existing).name;
+            // 重扫已添加的设备时顺带刷新密钥（电脑端可能已重新生成配对信息）
+            devices.get(existing).pairKey = pairing.key;
+        }
+        profile.pairKey = pairing.key;
         profile.pendingPairing = true;
         showDashboard(profile, pairing.pairingUrl);
+    }
+
+    /** 把扫码/粘贴得到的配对信息绑到超级岛（原生配对），并尽量同步回设备档案 */
+    private void applyIslandPairing(PairingData pairing) {
+        IslandConfig config = IslandConfig.load(this);
+        int known = indexOfDevice(pairing.baseUrl);
+        if (known >= 0) {
+            devices.get(known).pairKey = pairing.key;
+            saveProfiles();
+        }
+        config.baseUrl = pairing.baseUrl;
+        config.deviceName = known >= 0 ? devices.get(known).name : pairing.name;
+        config.pairingKey = pairing.key;
+        config.token = "";
+        config.tokenPairedAt = 0L;
+        config.save(this);
+        toast("已绑定电脑「" + config.deviceName + "」，现在可以完成配对");
+        showIslandDialogIfPossible();
     }
 
     private void onPairingConfirmed() {
@@ -282,7 +346,10 @@ public final class MainActivity extends ComponentActivity {
                 String name = item.optString("name", "").trim();
                 String baseUrl = item.optString("url", "").trim();
                 if (name.isEmpty() || baseUrl.isEmpty()) continue;
-                devices.add(new DeviceProfile(name, baseUrl));
+                DeviceProfile profile = new DeviceProfile(name, baseUrl);
+                // 旧版本没有保存配对密钥；为空时超级岛需要重新扫码才能原生配对
+                profile.pairKey = item.optString("pairKey", "").trim();
+                devices.add(profile);
             }
         } catch (JSONException ignored) {
             getSharedPreferences(PREFS, MODE_PRIVATE).edit().remove(PREF_PROFILES).apply();
@@ -296,6 +363,7 @@ public final class MainActivity extends ComponentActivity {
             try {
                 item.put("name", profile.name);
                 item.put("url", profile.baseUrl);
+                if (profile.pairKey != null && !profile.pairKey.isEmpty()) item.put("pairKey", profile.pairKey);
                 items.put(item);
             } catch (JSONException ignored) { }
         }
@@ -416,6 +484,9 @@ public final class MainActivity extends ComponentActivity {
             }
         }
 
+        content.addView(gap(26));
+        content.addView(islandSection(), matchWidth());
+
         content.addView(gap(12));
         TextView note = label("额度仍由电脑采集。电脑和访问网络保持运行时，手机才能读取最新信息。", 11, MUTED, false);
         note.setLineSpacing(dp(3), 1f);
@@ -431,6 +502,378 @@ public final class MainActivity extends ComponentActivity {
         updateParams.topMargin = dp(18);
         content.addView(update, updateParams);
         setContentView(root);
+    }
+
+    // ---- 超级岛（澎湃OS 焦点通知） --------------------------------------------
+
+    /** 设备列表上的超级岛区块：状态一览 + 管理入口 */
+    private View islandSection() {
+        IslandConfig config = IslandConfig.load(this);
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(dp(15), dp(14), dp(15), dp(14));
+        card.setBackground(round(SURFACE, 15, BORDER, 1));
+
+        LinearLayout head = new LinearLayout(this);
+        head.setGravity(Gravity.CENTER_VERTICAL);
+        TextView mark = label("⌾", 16, ACCENT, true);
+        mark.setGravity(Gravity.CENTER);
+        mark.setBackground(round(RAISED, 11, BORDER, 1));
+        head.addView(mark, new LinearLayout.LayoutParams(dp(42), dp(42)));
+        LinearLayout titleBox = new LinearLayout(this);
+        titleBox.setOrientation(LinearLayout.VERTICAL);
+        titleBox.setPadding(dp(12), 0, dp(8), 0);
+        titleBox.addView(label("超级岛 · 澎湃OS", 14, INK, true));
+        String source = config.baseUrl.isEmpty() ? "未绑定电脑" : (config.deviceName.isEmpty() ? hostAndPort(config.baseUrl) : config.deviceName);
+        titleBox.addView(label(source, 11, MUTED, false));
+        head.addView(titleBox, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        String status;
+        int statusColor;
+        if (config.enabled) {
+            status = "监控中";
+            statusColor = ACCENT;
+        } else if (!config.token.isEmpty() || !config.pairingKey.isEmpty()) {
+            status = "已就绪";
+            statusColor = lightTheme ? Color.rgb(120, 129, 136) : MUTED;
+        } else {
+            status = "未配置";
+            statusColor = MUTED;
+        }
+        TextView chip = label(status, 10, statusColor, true);
+        chip.setPadding(dp(9), dp(6), dp(9), dp(6));
+        chip.setBackground(round(RAISED, 20, BORDER, 1));
+        head.addView(chip);
+        card.addView(head, matchWidth());
+
+        TextView desc = label("在小米超级岛/焦点通知上常驻显示额度，通过 Shizuku 临时断开小米服务框架的白名单校验来绕过限制（非小米设备退化为普通通知）。", 11, MUTED, false);
+        desc.setLineSpacing(dp(3), 1f);
+        desc.setPadding(dp(2), dp(10), dp(2), 0);
+        card.addView(desc, matchWidth());
+
+        LinearLayout actions = new LinearLayout(this);
+        actions.setOrientation(LinearLayout.HORIZONTAL);
+        actions.setGravity(Gravity.CENTER_VERTICAL);
+        actions.setPadding(0, dp(13), 0, 0);
+        TextView manage = label("管理设置", 12, INK, true);
+        manage.setGravity(Gravity.CENTER);
+        manage.setMinHeight(dp(42));
+        manage.setBackground(round(RAISED, 11, BORDER, 1));
+        actions.addView(manage, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1));
+        TextView toggle = label(config.enabled ? "停止监控" : "开启监控", 12, ACCENT_INK, true);
+        toggle.setGravity(Gravity.CENTER);
+        toggle.setMinHeight(dp(42));
+        toggle.setBackground(round(ACCENT, 11, ACCENT, 0));
+        LinearLayout.LayoutParams toggleParams = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1);
+        toggleParams.leftMargin = dp(9);
+        actions.addView(toggle, toggleParams);
+        card.addView(actions, matchWidth());
+
+        manage.setOnClickListener(view -> showIslandDialog());
+        toggle.setOnClickListener(view -> toggleIslandMonitoring());
+        return card;
+    }
+
+    private void showIslandDialog() {
+        IslandConfig config = IslandConfig.load(this);
+        LinearLayout list = new LinearLayout(this);
+        list.setOrientation(LinearLayout.VERTICAL);
+        list.setPadding(dp(6), dp(4), dp(6), 0);
+
+        list.addView(islandRow("数据来源",
+                config.baseUrl.isEmpty() ? "未绑定" : (config.deviceName.isEmpty() ? hostAndPort(config.baseUrl) : config.deviceName),
+                "选择", () -> pickIslandDevice()));
+
+        String pairValue;
+        String pairAction;
+        if (!config.token.isEmpty()) {
+            pairValue = "已配对";
+            pairAction = "重新配对";
+        } else if (!config.pairingKey.isEmpty()) {
+            pairValue = "有密钥 · 待配对";
+            pairAction = "配对";
+        } else {
+            pairValue = "需要配对密钥";
+            pairAction = "扫码绑定";
+        }
+        list.addView(islandRow("配对状态", pairValue, pairAction, this::islandPairAction));
+
+        String shizukuValue;
+        String shizukuAction;
+        if (!XmsfBypass.binderAlive()) {
+            shizukuValue = "未运行";
+            shizukuAction = "打开";
+        } else if (!XmsfBypass.permissionGranted()) {
+            shizukuValue = "运行中 · 未授权";
+            shizukuAction = "授权";
+        } else {
+            shizukuValue = "已就绪";
+            shizukuAction = null;
+        }
+        list.addView(islandRow("Shizuku", shizukuValue, shizukuAction, this::shizukuAction));
+
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            boolean granted = checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED;
+            list.addView(islandRow("通知权限", granted ? "已授予" : "未授予", granted ? null : "去授权",
+                    this::requestIslandNotifPermission));
+        }
+
+        int protocol = FocusNotificationFactory.focusProtocol(this);
+        String support;
+        if (!FocusNotificationFactory.isXiaomi()) support = "非小米设备 · 普通通知";
+        else if (protocol >= 3) support = "超级岛（协议 " + protocol + "）";
+        else if (protocol == 2) support = "焦点通知（协议 2）";
+        else support = "协议探测为 0（仍会尝试发送）";
+        if (android.os.Build.VERSION.SDK_INT >= 36) support += " · 含原生实时活动";
+        list.addView(islandRow("设备支持", support, null, null));
+
+        list.addView(islandRow("自检诊断", "定位出不了岛的原因", "运行", this::runIslandDiagnostics));
+
+        TextView hint = label("「立即预览」会抓取一次额度并发出通知，用来检验 Shizuku 绕过与显示效果；监控开启后每 "
+                + config.intervalMinutes + " 分钟自动刷新。", 11, MUTED, false);
+        hint.setLineSpacing(dp(3), 1f);
+        hint.setPadding(dp(2), dp(10), dp(2), dp(2));
+        list.addView(hint, matchWidth());
+
+        islandDialog = new AlertDialog.Builder(this)
+                .setTitle("超级岛")
+                .setView(list)
+                .setNegativeButton("关闭", null)
+                .setPositiveButton("立即预览", (dialog, which) -> previewIslandNow())
+                .setNeutralButton(config.enabled ? "停止监控" : "开启监控", (dialog, which) -> toggleIslandMonitoring())
+                .show();
+    }
+
+    /** 权限/配对等异步状态变化后重建设置弹窗（仅在弹窗正打开时刷新，不打扰其它界面） */
+    private void reopenIslandDialog() {
+        boolean showing = islandDialog != null && islandDialog.isShowing();
+        if (showing) islandDialog.dismiss();
+        islandDialog = null;
+        if (showing && !showingDashboard && !isFinishing() && !isDestroyed()) showIslandDialog();
+    }
+
+    /** 扫码等流程结束后主动（重新）打开超级岛设置 */
+    private void showIslandDialogIfPossible() {
+        if (!showingDashboard && !isFinishing() && !isDestroyed()) showIslandDialog();
+    }
+
+    private View islandRow(String title, String value, String action, Runnable actionRunner) {
+        LinearLayout row = new LinearLayout(this);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(0, dp(10), 0, dp(10));
+        row.addView(label(title, 12, MUTED, false), new LinearLayout.LayoutParams(dp(84), ViewGroup.LayoutParams.WRAP_CONTENT));
+        TextView valueView = label(value, 12, INK, true);
+        valueView.setMaxLines(1);
+        valueView.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        row.addView(valueView, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        if (action != null && actionRunner != null) {
+            TextView actionView = label(action, 11, ACCENT, true);
+            actionView.setPadding(dp(10), dp(6), dp(10), dp(6));
+            actionView.setBackground(round(RAISED, 18, BORDER, 1));
+            actionView.setOnClickListener(view -> actionRunner.run());
+            row.addView(actionView);
+        }
+        return row;
+    }
+
+    private void pickIslandDevice() {
+        if (devices.isEmpty()) {
+            scanForIsland = true;
+            toast("先扫码绑定一台电脑");
+            launchScanner();
+            return;
+        }
+        String[] names = new String[devices.size()];
+        for (int i = 0; i < devices.size(); i++) names[i] = devices.get(i).name;
+        new AlertDialog.Builder(this)
+                .setTitle("选择数据来源")
+                .setItems(names, (dialog, which) -> {
+                    DeviceProfile profile = devices.get(which);
+                    IslandConfig config = IslandConfig.load(this);
+                    boolean changed = !profile.baseUrl.equals(config.baseUrl);
+                    config.baseUrl = profile.baseUrl;
+                    config.deviceName = profile.name;
+                    if (profile.pairKey != null && !profile.pairKey.isEmpty()) {
+                        if (!profile.pairKey.equals(config.pairingKey)) changed = true;
+                        config.pairingKey = profile.pairKey;
+                    }
+                    if (changed) {
+                        // 换电脑或换密钥后旧令牌必然无效
+                        config.token = "";
+                        config.tokenPairedAt = 0L;
+                    }
+                    config.save(this);
+                    reopenIslandDialog();
+                })
+                .setNeutralButton("扫码绑定", (dialog, which) -> {
+                    scanForIsland = true;
+                    launchScanner();
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    private void islandPairAction() {
+        IslandConfig config = IslandConfig.load(this);
+        if (config.pairingKey.isEmpty() || config.baseUrl.isEmpty()) {
+            scanForIsland = true;
+            launchScanner();
+            return;
+        }
+        pairIslandInBackground();
+    }
+
+    private void pairIslandInBackground() {
+        IslandConfig config = IslandConfig.load(this);
+        if (config.baseUrl.isEmpty() || config.pairingKey.isEmpty()) {
+            toast("先绑定电脑并获取配对密钥");
+            return;
+        }
+        toast("正在配对…");
+        new Thread(() -> {
+            String error = null;
+            try {
+                QuotaApi.PairResult result = QuotaApi.pair(config.origin(), config.pairingKey,
+                        config.deviceId(), IslandConfig.pairedDeviceName(this));
+                config.token = result.token;
+                config.tokenPairedAt = System.currentTimeMillis();
+                config.save(this);
+            } catch (Exception failure) {
+                error = failure.getMessage() == null ? "配对失败" : failure.getMessage();
+            }
+            final String message = error;
+            mainHandler.post(() -> {
+                if (isFinishing() || isDestroyed()) return;
+                toast(message == null ? "配对成功，令牌已保存" : "配对失败：" + message);
+                reopenIslandDialog();
+            });
+        }, "QuotaDesk-island-pair").start();
+    }
+
+    /** 一键自检：把设备能力/白名单/Shizuku/断网绕过的真实结果汇总出来，可复制回报 */
+    private void runIslandDiagnostics() {
+        toast("正在自检…");
+        new Thread(() -> {
+            final String report = IslandDiagnostics.run(this);
+            mainHandler.post(() -> {
+                if (isFinishing() || isDestroyed()) return;
+                new AlertDialog.Builder(this)
+                        .setTitle("超级岛自检报告")
+                        .setMessage(report)
+                        .setNegativeButton("关闭", null)
+                        .setPositiveButton("复制报告", (dialog, which) -> {
+                            android.content.ClipboardManager clipboard =
+                                    (android.content.ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+                            if (clipboard != null) {
+                                clipboard.setPrimaryClip(ClipData.newPlainText("QuotaDesk 超级岛自检", report));
+                                toast("报告已复制");
+                            }
+                        })
+                        .show();
+            });
+        }, "QuotaDesk-island-diag").start();
+    }
+
+    private void shizukuAction() {        if (!XmsfBypass.binderAlive()) {
+            try {
+                startActivity(getPackageManager().getLaunchIntentForPackage("moe.shizuku.privileged.api"));
+            } catch (Exception error) {
+                toast("未安装 Shizuku，请先安装并以其激活（无线调试或 Root）");
+            }
+            return;
+        }
+        if (!XmsfBypass.permissionGranted()) {
+            try {
+                Shizuku.requestPermission(REQUEST_SHIZUKU);
+            } catch (Exception error) {
+                toast("无法发起 Shizuku 授权：" + error.getMessage());
+            }
+        }
+    }
+
+    private void requestIslandNotifPermission() {
+        if (android.os.Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            notifPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS);
+        } else {
+            toast("通知权限已开启");
+        }
+    }
+
+    /** 不启动监控、只发一条真实通知，用于验收 Shizuku 绕过与超级岛渲染 */
+    private void previewIslandNow() {
+        new Thread(() -> {
+            String error = null;
+            try {
+                FocusNotificationFactory.ensureChannels(this);
+                IslandConfig config = IslandConfig.load(this);
+                if (config.token.isEmpty()) {
+                    if (config.pairingKey.isEmpty() || config.baseUrl.isEmpty()) {
+                        throw new IllegalStateException("还没有完成配对");
+                    }
+                    QuotaApi.PairResult result = QuotaApi.pair(config.origin(), config.pairingKey,
+                            config.deviceId(), IslandConfig.pairedDeviceName(this));
+                    config.token = result.token;
+                    config.tokenPairedAt = System.currentTimeMillis();
+                }
+                org.json.JSONObject snapshot = QuotaApi.fetchSnapshot(config.origin(), config.token);
+                config.sequence++;
+                config.save(this);
+                FocusNotificationFactory.IslandData data = FocusNotificationFactory.parse(snapshot);
+                android.app.Notification notification = FocusNotificationFactory.build(this, data, config.sequence, true);
+                XmsfBypass.notifyNow(this, QuotaIslandService.NOTIFICATION_ISLAND, notification);
+            } catch (Exception failure) {
+                error = failure.getMessage() == null ? failure.getClass().getSimpleName() : failure.getMessage();
+            }
+            final String message = error;
+            final String bypassNote = XmsfBypass.lastBlockError == null || XmsfBypass.lastBlockError.isEmpty()
+                    ? "" : "（" + XmsfBypass.lastBlockError + "）";
+            mainHandler.post(() -> {
+                if (isFinishing() || isDestroyed()) return;
+                toast(message == null ? "已发送，查看通知栏 / 超级岛" + bypassNote : "预览失败：" + message);
+            });
+        }, "QuotaDesk-island-preview").start();
+    }
+
+    private void toggleIslandMonitoring() {
+        IslandConfig config = IslandConfig.load(this);
+        if (config.enabled) {
+            config.enabled = false;
+            config.save(this);
+            QuotaIslandService.stop(this);
+            toast("超级岛监控已停止");
+            showDevices();
+            return;
+        }
+        if (config.baseUrl.isEmpty() || (config.token.isEmpty() && config.pairingKey.isEmpty())) {
+            toast("先在管理设置里绑定电脑并完成配对");
+            showIslandDialog();
+            return;
+        }
+        if (android.os.Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            toast("需要通知权限");
+            requestIslandNotifPermission();
+            return;
+        }
+        if (!XmsfBypass.ready() && FocusNotificationFactory.focusSupported(this)) {
+            new AlertDialog.Builder(this)
+                    .setTitle("Shizuku 未就绪")
+                    .setMessage("Shizuku 未运行或未授权时，焦点通知会被小米白名单拦截，只显示为普通通知。仍要现在开启吗？")
+                    .setNegativeButton("先去设置", (dialog, which) -> showIslandDialog())
+                    .setPositiveButton("仍要开启", (dialog, which) -> startIslandMonitoring())
+                    .show();
+            return;
+        }
+        startIslandMonitoring();
+    }
+
+    private void startIslandMonitoring() {
+        IslandConfig config = IslandConfig.load(this);
+        config.enabled = true;
+        config.save(this);
+        QuotaIslandService.start(this);
+        toast("超级岛监控已开启，每 " + config.intervalMinutes + " 分钟刷新");
+        showDevices();
     }
 
     private void checkForUpdates(boolean userInitiated) {
@@ -784,6 +1227,18 @@ public final class MainActivity extends ComponentActivity {
                     int index = indexOfDevice(profile.baseUrl);
                     if (index >= 0) devices.remove(index);
                     saveProfiles();
+                    // 超级岛绑定的就是这台电脑时一并解绑并停掉监控
+                    IslandConfig config = IslandConfig.load(this);
+                    if (profile.baseUrl.equals(config.baseUrl)) {
+                        config.enabled = false;
+                        config.baseUrl = "";
+                        config.deviceName = "";
+                        config.pairingKey = "";
+                        config.token = "";
+                        config.tokenPairedAt = 0L;
+                        config.save(this);
+                        QuotaIslandService.stop(this);
+                    }
                     Uri uri = Uri.parse(profile.baseUrl);
                     String origin = uri.getScheme() + "://" + uri.getAuthority();
                     WebStorage.getInstance().deleteOrigin(origin);
@@ -982,24 +1437,7 @@ public final class MainActivity extends ComponentActivity {
      * 电脑端配对接口限制 60 字符，这里提前对齐。
      */
     private String deviceDisplayName() {
-        String name = null;
-        if (android.os.Build.VERSION.SDK_INT >= 25) {
-            try {
-                name = Settings.Global.getString(getContentResolver(), Settings.Global.DEVICE_NAME);
-            } catch (Exception ignored) { }
-        }
-        if (name == null || name.trim().isEmpty()) {
-            try {
-                name = Settings.Secure.getString(getContentResolver(), "bluetooth_name");
-            } catch (Exception ignored) { }
-        }
-        if (name == null || name.trim().isEmpty()) {
-            String model = android.os.Build.MODEL == null ? "" : android.os.Build.MODEL.trim();
-            String maker = android.os.Build.MANUFACTURER == null ? "" : android.os.Build.MANUFACTURER.trim();
-            name = !model.isEmpty() ? model : (!maker.isEmpty() ? maker : "Android 手机");
-        }
-        name = name.replaceAll("\\p{Cntrl}", " ").trim();
-        return name.length() > 60 ? name.substring(0, 60).trim() : name;
+        return IslandConfig.deviceBaseName(this);
     }
 
     /**
@@ -1433,6 +1871,8 @@ public final class MainActivity extends ComponentActivity {
     private static final class DeviceProfile {
         String name;
         final String baseUrl;
+        /** 配对密钥（电脑端重新生成前一直有效），供超级岛原生配对使用 */
+        String pairKey;
         boolean pendingPairing;
         DeviceProfile(String name, String baseUrl) {
             this.name = name;
@@ -1444,10 +1884,12 @@ public final class MainActivity extends ComponentActivity {
         final String name;
         final String baseUrl;
         final String pairingUrl;
-        PairingData(String name, String baseUrl, String pairingUrl) {
+        final String key;
+        PairingData(String name, String baseUrl, String pairingUrl, String key) {
             this.name = name;
             this.baseUrl = baseUrl;
             this.pairingUrl = pairingUrl;
+            this.key = key;
         }
     }
 

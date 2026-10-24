@@ -2,8 +2,8 @@ plugins {
     id("com.android.application")
 }
 
-val appVersionName = providers.gradleProperty("appVersionName").orNull ?: "0.0.9"
-val appVersionCode = providers.gradleProperty("appVersionCode").orNull?.toIntOrNull() ?: 61
+val appVersionName = providers.gradleProperty("appVersionName").orNull ?: "0.0.11"
+val appVersionCode = providers.gradleProperty("appVersionCode").orNull?.toIntOrNull() ?: 63
 val releaseKeystorePath = System.getenv("ANDROID_KEYSTORE_PATH")
 val releaseKeystorePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
 val releaseKeyAlias = System.getenv("ANDROID_KEY_ALIAS")
@@ -17,7 +17,7 @@ val hasReleaseSigning = listOf(
 
 android {
     namespace = "com.quotadesk.mobile"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.quotadesk.mobile"
@@ -40,10 +40,16 @@ android {
 
     buildTypes {
         getByName("release") {
-            check(hasReleaseSigning) {
-                "Set ANDROID_KEYSTORE_PATH, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, and ANDROID_KEY_PASSWORD to build a signed release APK."
+            // 签名校验只在真正要构建 release 时执行，本地 assembleDebug 不受影响
+            val wantsRelease = gradle.startParameter.taskNames.any { it.contains("Release", ignoreCase = true) }
+            if (wantsRelease) {
+                check(hasReleaseSigning) {
+                    "Set ANDROID_KEYSTORE_PATH, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, and ANDROID_KEY_PASSWORD to build a signed release APK."
+                }
             }
-            signingConfig = signingConfigs.getByName("release")
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
 
@@ -59,5 +65,8 @@ dependencies {
     implementation("androidx.camera:camera-lifecycle:1.5.3")
     implementation("androidx.camera:camera-view:1.5.3")
     implementation("com.google.mlkit:barcode-scanning:17.3.0")
+    // Shizuku：以 adb/root 特权身份调用隐藏防火墙接口，绕过超级岛焦点通知的小米白名单
+    implementation("dev.rikka.shizuku:api:13.1.5")
+    implementation("dev.rikka.shizuku:provider:13.1.5")
 }
 
