@@ -273,6 +273,23 @@ public final class FocusNotificationFactory {
         return "#2E8B66";
     }
 
+    /** 告警色的亮色变体：焦点卡片使用深色底，颜色需要更亮才看得清 */
+    private static String urgencyColorBright(QuotaRow row) {
+        if (row == null || !row.percentage) return "#6FD69E";
+        if (row.remainingPct < 20) return "#FF6B66";
+        if (row.remainingPct < 50) return "#FFC24B";
+        return "#6FD69E";
+    }
+
+    // 深色品牌卡片配色（背景色接管亮暗两种模式，文字固定用亮色系）
+    private static final String CARD_BG = "#132820";
+    private static final String CARD_TITLE = "#F0FAF4";
+    private static final String CARD_SUB = "#9FD4B5";
+    private static final String CARD_CONTENT = "#CFEBDD";
+    private static final String CARD_SUBCONTENT = "#8CC1A4";
+    private static final String CARD_PROGRESS = "#6FD69E";
+    private static final String CARD_TRACK = "#3A4A42";
+
     /** 单账号一行的明细文案："账号：5 小时 剩42%（1 小时后重置）" */
     private static String rowLine(QuotaRow row) {
         StringBuilder line = new StringBuilder(row.account).append("：")
@@ -321,15 +338,38 @@ public final class FocusNotificationFactory {
             liveExtras.putBoolean("android.requestPromotedOngoing", true);
             liveExtras.putString("android.shortCriticalText", shortCritical);
             builder.addExtras(liveExtras);
-            String bigTitle = multi ? "额度 · " + data.rows.size() + " 个账号 · 最紧张 " + primary.valueText() : title;
-            builder.setStyle(new Notification.BigTextStyle()
-                    .setBigContentTitle(bigTitle)
-                    .bigText(bigText(data, content, reset)));
+            if (primary != null && primary.remainingPct >= 0) {
+                // 实时活动的招牌样式：分段进度条，剩余段按告警配色，游标落在已用/剩余分界
+                Notification.ProgressStyle style = new Notification.ProgressStyle();
+                style.addProgressSegment(new Notification.ProgressStyle.Segment(primary.remainingPct)
+                        .setColor(android.graphics.Color.parseColor(urgencyColorBright(primary))));
+                style.addProgressSegment(new Notification.ProgressStyle.Segment(100 - primary.remainingPct)
+                        .setColor(android.graphics.Color.parseColor(CARD_TRACK)));
+                style.setProgress(100 - primary.remainingPct);
+                builder.setStyle(style);
+                if (multi) builder.setSubText(othersSummary(data));
+            } else {
+                // 纯余额类没有比例可画，退回逐账号文本明细
+                builder.setStyle(new Notification.BigTextStyle()
+                        .setBigContentTitle(title)
+                        .bigText(bigText(data, content, reset)));
+            }
         }
         if (focusSupported(context)) {
             builder.addExtras(focusExtras(context, data, sequence, requestFloat, ticker));
         }
         return builder.build();
+    }
+
+    /** 其余账号的单行摘要："B 剩78% · C 剩5%" */
+    private static String othersSummary(IslandData data) {
+        StringBuilder summary = new StringBuilder();
+        for (int i = 1; i < data.rows.size(); i++) {
+            QuotaRow row = data.rows.get(i);
+            if (summary.length() > 0) summary.append(" · ");
+            summary.append(row.account).append(' ').append(row.valueText());
+        }
+        return summary.toString();
     }
 
     /** 实时活动展开态的正文：每个账号一行明细 */
@@ -354,26 +394,34 @@ public final class FocusNotificationFactory {
         int detected = focusProtocol(context);
         int protocol = detected >= 2 ? Math.min(detected, 3) : 3;
         try {
+            // 深色品牌卡片：背景色接管亮暗两种模式，文字固定亮色系；剩余值做成彩色徽章
             JSONObject baseInfo = new JSONObject()
                     .put("type", 1)
                     .put("title", primary != null ? primary.account : "Quota Desk")
-                    .put("subTitle", primary != null ? primary.windowLabel + "窗口" : "额度");
+                    .put("subTitle", primary != null ? primary.windowLabel + "窗口" : "额度")
+                    .put("specialTitle", primary != null ? primary.valueText() : null)
+                    .put("colorSpecialTitle", "#FFFFFF")
+                    .put("colorSpecialTitleDark", "#FFFFFF")
+                    .put("colorSpecialBg", urgencyColorBright(primary))
+                    .put("colorSpecialBgDark", urgencyColorBright(primary))
+                    .put("colorTitle", CARD_TITLE)
+                    .put("colorTitleDark", CARD_TITLE)
+                    .put("colorSubTitle", CARD_SUB)
+                    .put("colorSubTitleDark", CARD_SUB);
             if (primary != null) {
-                String line = primary.percentage
-                        ? "剩余 " + primary.remainingPct + "%"
-                        : primary.balanceText;
-                if (!primary.resetText.isEmpty()) line += " · " + primary.resetText;
+                String line = primary.percentage ? "已用 " + (100 - primary.remainingPct) + "%" : "";
+                if (!primary.resetText.isEmpty()) line += (line.isEmpty() ? "" : " · ") + primary.resetText;
+                if (line.isEmpty()) line = "余额 " + primary.balanceText;
                 baseInfo.put("content", line);
-                StringBuilder secondary = new StringBuilder();
-                for (int i = 1; i < data.rows.size(); i++) {
-                    QuotaRow row = data.rows.get(i);
-                    if (secondary.length() > 0) secondary.append(" · ");
-                    secondary.append(row.account).append(' ').append(row.valueText());
-                }
-                if (secondary.length() > 0) baseInfo.put("subContent", secondary.toString());
+                String others = othersSummary(data);
+                if (!others.isEmpty()) baseInfo.put("subContent", others);
             } else {
                 baseInfo.put("content", "电脑端暂无可展示的账号");
             }
+            baseInfo.put("colorContent", CARD_CONTENT)
+                    .put("colorContentDark", CARD_CONTENT)
+                    .put("colorSubContent", CARD_SUBCONTENT)
+                    .put("colorSubContentDark", CARD_SUBCONTENT);
 
             JSONObject paramV2 = new JSONObject()
                     .put("protocol", protocol)
@@ -390,6 +438,9 @@ public final class FocusNotificationFactory {
                     .put("isShowNotification", true)
                     .put("islandFirstFloat", requestFloat)
                     .put("enableFloat", requestFloat)
+                    .put("bgInfo", new JSONObject()
+                            .put("type", 1)
+                            .put("colorBg", CARD_BG))
                     .put("baseInfo", baseInfo);
             // 进度组件：单账号用单进度条；多账号切换为逐账号带标题的多进度条（最多 3 条，颜色按告警分级）
             if (data.rows.size() > 1) {
@@ -400,12 +451,14 @@ public final class FocusNotificationFactory {
                     multiProgress.put(new JSONObject()
                             .put("title", row.account + " " + row.valueText())
                             .put("progress", row.remainingPct)
-                            .put("color", urgencyColor(row)));
+                            .put("color", urgencyColorBright(row)));
                     bars++;
                 }
                 if (multiProgress.length() > 0) paramV2.put("multiProgressInfo", multiProgress);
             } else if (primary != null && primary.remainingPct >= 0) {
-                paramV2.put("progressInfo", new JSONObject().put("progress", primary.remainingPct));
+                paramV2.put("progressInfo", new JSONObject()
+                        .put("progress", primary.remainingPct)
+                        .put("colorProgress", CARD_PROGRESS));
             }
 
             // 大岛展开态：左栏放最紧张的账号（图标+数值+倒计时），第二个账号放右栏，更多账号折叠计数
