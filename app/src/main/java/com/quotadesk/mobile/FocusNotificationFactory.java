@@ -302,7 +302,7 @@ public final class FocusNotificationFactory {
      * @param requestFloat 本条是否以展开态出现（首次展示/手动预览时为 true，
      *                     周期刷新为 false，避免每 5 分钟弹一次打断使用）
      */
-    public static Notification build(Context context, IslandData data, long sequence, boolean requestFloat) {
+    public static Notification build(Context context, IslandData data, long sequence, boolean requestFloat, IslandConfig style) {
         QuotaRow primary = data.primary();
         boolean multi = data.rows.size() > 1;
         String title = primary != null ? primary.account : "Quota Desk";
@@ -338,25 +338,28 @@ public final class FocusNotificationFactory {
             liveExtras.putBoolean("android.requestPromotedOngoing", true);
             liveExtras.putString("android.shortCriticalText", shortCritical);
             builder.addExtras(liveExtras);
-            if (primary != null && primary.remainingPct >= 0) {
+            String liveStyle = style == null ? "auto" : style.liveStyle;
+            boolean preferProgress = "progress".equals(liveStyle)
+                    || ("auto".equals(liveStyle) && primary != null && primary.remainingPct >= 0);
+            if (preferProgress && primary != null && primary.remainingPct >= 0) {
                 // 实时活动的招牌样式：分段进度条，剩余段按告警配色，游标落在已用/剩余分界
-                Notification.ProgressStyle style = new Notification.ProgressStyle();
-                style.addProgressSegment(new Notification.ProgressStyle.Segment(primary.remainingPct)
+                Notification.ProgressStyle progressStyle = new Notification.ProgressStyle();
+                progressStyle.addProgressSegment(new Notification.ProgressStyle.Segment(primary.remainingPct)
                         .setColor(android.graphics.Color.parseColor(urgencyColorBright(primary))));
-                style.addProgressSegment(new Notification.ProgressStyle.Segment(100 - primary.remainingPct)
+                progressStyle.addProgressSegment(new Notification.ProgressStyle.Segment(100 - primary.remainingPct)
                         .setColor(android.graphics.Color.parseColor(CARD_TRACK)));
-                style.setProgress(100 - primary.remainingPct);
-                builder.setStyle(style);
+                progressStyle.setProgress(100 - primary.remainingPct);
+                builder.setStyle(progressStyle);
                 if (multi) builder.setSubText(othersSummary(data));
             } else {
-                // 纯余额类没有比例可画，退回逐账号文本明细
+                // 逐账号文本明细（或无比例数据时的回退）
                 builder.setStyle(new Notification.BigTextStyle()
                         .setBigContentTitle(title)
                         .bigText(bigText(data, content, reset)));
             }
         }
         if (focusSupported(context)) {
-            builder.addExtras(focusExtras(context, data, sequence, requestFloat, ticker));
+            builder.addExtras(focusExtras(context, data, sequence, requestFloat, ticker, style));
         }
         return builder.build();
     }
@@ -383,45 +386,158 @@ public final class FocusNotificationFactory {
         return text.toString();
     }
 
+    /** 明细行："5 小时窗口 剩42% · 1 小时 23 分后重置"（供各模板共用） */
+    private static String contentLine(QuotaRow row) {
+        String line = row.windowLabel + "窗口 " + row.valueText();
+        if (!row.resetText.isEmpty()) line += " · " + row.resetText;
+        return line;
+    }
+
     /**
      * 组装 miui.focus.param / miui.focus.pics：
-     * JSON 根节点 param_v2，卡片走 baseInfo+progressInfo，超级岛走 param_island
-     * （协议 2 的设备会忽略 param_island，仅显示状态栏/通知栏/AOD 形态）。
+     * JSON 根节点 param_v2，卡片模板由 IslandConfig.cardTemplate 决定（六选一），
+     * 背景色、进度条、徽章、超级岛（param_island）均可在设置里切换。
      */
-    static Bundle focusExtras(Context context, IslandData data, long sequence, boolean requestFloat, String ticker) {
+    static Bundle focusExtras(Context context, IslandData data, long sequence, boolean requestFloat, String ticker, IslandConfig config) {
         QuotaRow primary = data.primary();
         // 探测不到协议（0/1）不代表不支持：按超级岛（3）目标发送，不支持的 ROM 会自行忽略
         int detected = focusProtocol(context);
         int protocol = detected >= 2 ? Math.min(detected, 3) : 3;
+        String template = config == null ? "auto" : config.cardTemplate;
+        if ("auto".equals(template)) template = "base";
         try {
-            // 深色品牌卡片：背景色接管亮暗两种模式，文字固定亮色系；剩余值做成彩色徽章
-            JSONObject baseInfo = new JSONObject()
-                    .put("type", 1)
-                    .put("title", primary != null ? primary.account : "Quota Desk")
-                    .put("subTitle", primary != null ? primary.windowLabel + "窗口" : "额度")
-                    .put("specialTitle", primary != null ? primary.valueText() : null)
-                    .put("colorSpecialTitle", "#FFFFFF")
-                    .put("colorSpecialTitleDark", "#FFFFFF")
-                    .put("colorSpecialBg", urgencyColorBright(primary))
-                    .put("colorSpecialBgDark", urgencyColorBright(primary))
-                    .put("colorTitle", CARD_TITLE)
-                    .put("colorTitleDark", CARD_TITLE)
-                    .put("colorSubTitle", CARD_SUB)
-                    .put("colorSubTitleDark", CARD_SUB);
-            if (primary != null) {
-                String line = primary.percentage ? "已用 " + (100 - primary.remainingPct) + "%" : "";
-                if (!primary.resetText.isEmpty()) line += (line.isEmpty() ? "" : " · ") + primary.resetText;
-                if (line.isEmpty()) line = "余额 " + primary.balanceText;
-                baseInfo.put("content", line);
-                String others = othersSummary(data);
-                if (!others.isEmpty()) baseInfo.put("subContent", others);
-            } else {
-                baseInfo.put("content", "电脑端暂无可展示的账号");
+            String title = primary != null ? primary.account : "Quota Desk";
+            String others = othersSummary(data);
+            JSONObject templateJson;
+            String templateKey;
+            switch (template) {
+                case "chat": {
+                    // 头像气泡：应用图标作头像，单行内容
+                    String content = primary != null ? contentLine(primary) : "电脑端暂无可展示的账号";
+                    if (!others.isEmpty()) content += " ｜ " + others;
+                    templateKey = "chatInfo";
+                    templateJson = new JSONObject()
+                            .put("type", 1)
+                            .put("title", title)
+                            .put("content", content)
+                            .put("picProfile", "miui.focus.pic_island")
+                            .put("picProfileDark", "miui.focus.pic_island")
+                            .put("colorTitle", CARD_TITLE)
+                            .put("colorTitleDark", CARD_TITLE)
+                            .put("colorContent", CARD_CONTENT)
+                            .put("colorContentDark", CARD_CONTENT);
+                    break;
+                }
+                case "highlight": {
+                    // 高亮大字：剩余值放大居中，窗口标签做成彩色徽章
+                    templateKey = "highlightInfoV3";
+                    templateJson = new JSONObject()
+                            .put("primaryText", primary != null ? primary.valueText() : "--")
+                            .put("secondaryText", primary != null && primary.percentage
+                                    ? "已用 " + (100 - primary.remainingPct) + "%" : null)
+                            .put("highLightText", primary != null ? primary.windowLabel + "窗口" : "额度")
+                            .put("primaryColor", CARD_TITLE)
+                            .put("primaryColorDark", CARD_TITLE)
+                            .put("secondaryColor", CARD_SUBCONTENT)
+                            .put("secondaryColorDark", CARD_SUBCONTENT)
+                            .put("highLightTextColor", "#FFFFFF")
+                            .put("highLightTextColorDark", "#FFFFFF")
+                            .put("highLightBgColor", urgencyColorBright(primary))
+                            .put("highLightBgColorDark", urgencyColorBright(primary));
+                    break;
+                }
+                case "cover": {
+                    // 封面大图：应用图标作封面
+                    templateKey = "coverInfo";
+                    templateJson = new JSONObject()
+                            .put("picCover", "miui.focus.pic_island")
+                            .put("title", title)
+                            .put("content", primary != null ? contentLine(primary) : "电脑端暂无可展示的账号")
+                            .put("subTitle", null)
+                            .put("subContent", others.isEmpty() ? null : others)
+                            .put("colorTitle", CARD_TITLE)
+                            .put("colorTitleDark", CARD_TITLE)
+                            .put("colorContent", CARD_CONTENT)
+                            .put("colorContentDark", CARD_CONTENT)
+                            .put("colorSubContent", CARD_SUBCONTENT)
+                            .put("colorSubContentDark", CARD_SUBCONTENT);
+                    break;
+                }
+                case "animtext": {
+                    // 动画图标 + 文字（静态图标亦可）
+                    templateKey = "animTextInfo";
+                    templateJson = new JSONObject()
+                            .put("animIconInfo", new JSONObject()
+                                    .put("type", 0)
+                                    .put("src", "miui.focus.pic_island")
+                                    .put("srcDark", "miui.focus.pic_island")
+                                    .put("loop", false)
+                                    .put("autoplay", false))
+                            .put("title", title)
+                            .put("content", primary != null ? contentLine(primary) : "电脑端暂无可展示的账号")
+                            .put("colorTitle", CARD_TITLE)
+                            .put("colorTitleDark", CARD_TITLE)
+                            .put("colorContent", CARD_CONTENT)
+                            .put("colorContentDark", CARD_CONTENT);
+                    break;
+                }
+                case "icontext": {
+                    // 图标 + 文字 + 次要行
+                    templateKey = "iconTextInfo";
+                    templateJson = new JSONObject()
+                            .put("animIconInfo", new JSONObject()
+                                    .put("type", 0)
+                                    .put("src", "miui.focus.pic_island")
+                                    .put("srcDark", "miui.focus.pic_island")
+                                    .put("loop", false)
+                                    .put("autoplay", false))
+                            .put("title", title)
+                            .put("content", primary != null ? contentLine(primary) : "电脑端暂无可展示的账号")
+                            .put("subContent", others.isEmpty() ? null : others)
+                            .put("colorTitle", CARD_TITLE)
+                            .put("colorTitleDark", CARD_TITLE)
+                            .put("colorContent", CARD_CONTENT)
+                            .put("colorContentDark", CARD_CONTENT)
+                            .put("colorSubContent", CARD_SUBCONTENT)
+                            .put("colorSubContentDark", CARD_SUBCONTENT);
+                    break;
+                }
+                default: {
+                    // 基础卡片：深色品牌底，剩余值做成彩色徽章（可关）
+                    boolean badge = config == null || config.showBadge;
+                    JSONObject base = new JSONObject()
+                            .put("type", 1)
+                            .put("title", title)
+                            .put("subTitle", primary != null ? primary.windowLabel + "窗口" : "额度")
+                            .put("colorTitle", CARD_TITLE)
+                            .put("colorTitleDark", CARD_TITLE)
+                            .put("colorSubTitle", CARD_SUB)
+                            .put("colorSubTitleDark", CARD_SUB);
+                    if (badge && primary != null) {
+                        base.put("specialTitle", primary.valueText())
+                                .put("colorSpecialTitle", "#FFFFFF")
+                                .put("colorSpecialTitleDark", "#FFFFFF")
+                                .put("colorSpecialBg", urgencyColorBright(primary))
+                                .put("colorSpecialBgDark", urgencyColorBright(primary));
+                    }
+                    if (primary != null) {
+                        String line = primary.percentage ? "已用 " + (100 - primary.remainingPct) + "%" : "";
+                        if (!primary.resetText.isEmpty()) line += (line.isEmpty() ? "" : " · ") + primary.resetText;
+                        if (line.isEmpty()) line = "余额 " + primary.balanceText;
+                        base.put("content", line);
+                        if (!others.isEmpty()) base.put("subContent", others);
+                    } else {
+                        base.put("content", "电脑端暂无可展示的账号");
+                    }
+                    base.put("colorContent", CARD_CONTENT)
+                            .put("colorContentDark", CARD_CONTENT)
+                            .put("colorSubContent", CARD_SUBCONTENT)
+                            .put("colorSubContentDark", CARD_SUBCONTENT);
+                    templateKey = "baseInfo";
+                    templateJson = base;
+                    break;
+                }
             }
-            baseInfo.put("colorContent", CARD_CONTENT)
-                    .put("colorContentDark", CARD_CONTENT)
-                    .put("colorSubContent", CARD_SUBCONTENT)
-                    .put("colorSubContentDark", CARD_SUBCONTENT);
 
             JSONObject paramV2 = new JSONObject()
                     .put("protocol", protocol)
@@ -438,27 +554,36 @@ public final class FocusNotificationFactory {
                     .put("isShowNotification", true)
                     .put("islandFirstFloat", requestFloat)
                     .put("enableFloat", requestFloat)
-                    .put("bgInfo", new JSONObject()
-                            .put("type", 1)
-                            .put("colorBg", CARD_BG))
-                    .put("baseInfo", baseInfo);
-            // 进度组件：单账号用单进度条；多账号切换为逐账号带标题的多进度条（最多 3 条，颜色按告警分级）
-            if (data.rows.size() > 1) {
-                JSONArray multiProgress = new JSONArray();
-                int bars = 0;
-                for (QuotaRow row : data.rows) {
-                    if (bars >= 3 || row.remainingPct < 0) continue;
-                    multiProgress.put(new JSONObject()
-                            .put("title", row.account + " " + row.valueText())
-                            .put("progress", row.remainingPct)
-                            .put("color", urgencyColorBright(row)));
-                    bars++;
+                    .put(templateKey, templateJson);
+            // 卡片背景：品牌墨绿 / 炭黑 / 跟随系统
+            String cardBg = config == null ? "brand" : config.cardBg;
+            if (!"none".equals(cardBg)) {
+                paramV2.put("bgInfo", new JSONObject()
+                        .put("type", 1)
+                        .put("colorBg", "black".equals(cardBg) ? "#101312" : CARD_BG));
+            }
+            // 进度组件：auto=单账号单条/多账号多条；single/multi/none 强制指定
+            String progressMode = config == null ? "auto" : config.progressMode;
+            boolean wantMulti = "multi".equals(progressMode)
+                    || ("auto".equals(progressMode) && data.rows.size() > 1);
+            if (!"none".equals(progressMode)) {
+                if (wantMulti) {
+                    JSONArray multiProgress = new JSONArray();
+                    int bars = 0;
+                    for (QuotaRow row : data.rows) {
+                        if (bars >= 3 || row.remainingPct < 0) continue;
+                        multiProgress.put(new JSONObject()
+                                .put("title", row.account + " " + row.valueText())
+                                .put("progress", row.remainingPct)
+                                .put("color", urgencyColorBright(row)));
+                        bars++;
+                    }
+                    if (multiProgress.length() > 0) paramV2.put("multiProgressInfo", multiProgress);
+                } else if (primary != null && primary.remainingPct >= 0) {
+                    paramV2.put("progressInfo", new JSONObject()
+                            .put("progress", primary.remainingPct)
+                            .put("colorProgress", CARD_PROGRESS));
                 }
-                if (multiProgress.length() > 0) paramV2.put("multiProgressInfo", multiProgress);
-            } else if (primary != null && primary.remainingPct >= 0) {
-                paramV2.put("progressInfo", new JSONObject()
-                        .put("progress", primary.remainingPct)
-                        .put("colorProgress", CARD_PROGRESS));
             }
 
             // 大岛展开态：左栏放最紧张的账号（图标+数值+倒计时），第二个账号放右栏，更多账号折叠计数
@@ -530,7 +655,7 @@ public final class FocusNotificationFactory {
         List<QuotaRow> rows = new ArrayList<>();
         rows.add(new QuotaRow("示例账号", "five_hour", true, 42, null, "1 小时 23 分后重置"));
         rows.add(new QuotaRow("示例账号B", "weekly", true, 78, null, ""));
-        Bundle extras = focusExtras(context, new IslandData(rows), 1L, true, "示例账号 剩42%");
+        Bundle extras = focusExtras(context, new IslandData(rows), 1L, true, "示例账号 剩42%", null);
         return extras.getString("miui.focus.param", "");
     }
 }

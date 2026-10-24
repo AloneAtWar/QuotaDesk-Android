@@ -121,6 +121,7 @@ public final class MainActivity extends ComponentActivity {
     private static final int REQUEST_SHIZUKU = 4101;
     private ActivityResultLauncher<String> notifPermissionLauncher;
     private AlertDialog islandDialog;
+    private AlertDialog islandStyleDialog;
     /** 扫码目标：true = 给超级岛绑定电脑，false = 走原有的添加设备流程 */
     private boolean scanForIsland;
     private final Shizuku.OnRequestPermissionResultListener shizukuPermissionListener = (requestCode, grantResult) -> {
@@ -626,6 +627,8 @@ public final class MainActivity extends ComponentActivity {
         if (android.os.Build.VERSION.SDK_INT >= 36) support += " · 含原生实时活动";
         list.addView(islandRow("设备支持", support, null, null));
 
+        list.addView(islandRow("显示样式", cardTemplateLabel(config.cardTemplate) + " · " + cardBgLabel(config.cardBg), "设置", this::showIslandStyleDialog));
+
         list.addView(islandRow("自检诊断", "定位出不了岛的原因", "运行", this::runIslandDiagnostics));
 
         TextView hint = label("「立即预览」会抓取一次额度并发出通知，用来检验 Shizuku 绕过与显示效果；监控开启后每 "
@@ -750,6 +753,121 @@ public final class MainActivity extends ComponentActivity {
     }
 
     /** 一键自检：把设备能力/白名单/Shizuku/断网绕过的真实结果汇总出来，可复制回报 */
+    /** 显示样式面板：卡片模板/背景/进度条/徽章/实时活动样式全部开放切换，改完即可预览 */
+    private void showIslandStyleDialog() {
+        if (islandStyleDialog != null && islandStyleDialog.isShowing()) islandStyleDialog.dismiss();
+        IslandConfig config = IslandConfig.load(this);
+        LinearLayout list = new LinearLayout(this);
+        list.setOrientation(LinearLayout.VERTICAL);
+        list.setPadding(dp(6), dp(4), dp(6), 0);
+
+        list.addView(islandRow("卡片模板", cardTemplateLabel(config.cardTemplate), "选择", () -> pickStyleOption(
+                "卡片模板",
+                new String[]{"自动（基础卡片）", "基础卡片（徽章+多行）", "头像气泡", "高亮大字（数值居中）", "封面大图", "动画图标文字", "图标文字（含次要行）"},
+                new String[]{"auto", "base", "chat", "highlight", "cover", "animtext", "icontext"},
+                config.cardTemplate, styleSaver((fresh, value) -> fresh.cardTemplate = value))));
+
+        list.addView(islandRow("卡片背景", cardBgLabel(config.cardBg), "选择", () -> pickStyleOption(
+                "卡片背景",
+                new String[]{"品牌墨绿", "炭黑", "跟随系统（无背景）"},
+                new String[]{"brand", "black", "none"},
+                config.cardBg, styleSaver((fresh, value) -> fresh.cardBg = value))));
+
+        list.addView(islandRow("进度条", progressLabel(config.progressMode), "选择", () -> pickStyleOption(
+                "进度条",
+                new String[]{"自动（单账号单条 / 多账号逐账号）", "单进度条（最紧张账号）", "多进度条（逐账号，最多3条）", "不显示"},
+                new String[]{"auto", "single", "multi", "none"},
+                config.progressMode, styleSaver((fresh, value) -> fresh.progressMode = value))));
+
+        list.addView(islandRow("数值徽章", config.showBadge ? "开" : "关", "切换", () -> {
+            IslandConfig current = IslandConfig.load(this);
+            current.showBadge = !current.showBadge;
+            current.save(this);
+            showIslandStyleDialog();
+        }));
+
+        if (android.os.Build.VERSION.SDK_INT >= 36) {
+            list.addView(islandRow("实时活动样式", liveStyleLabel(config.liveStyle), "选择", () -> pickStyleOption(
+                    "实时活动样式（Android 16）",
+                    new String[]{"自动（有比例用分段进度条）", "分段进度条", "文本明细（逐账号多行）"},
+                    new String[]{"auto", "progress", "text"},
+                    config.liveStyle, styleSaver((fresh, value) -> fresh.liveStyle = value))));
+        }
+
+        TextView hint = label("切换后点「立即预览」马上看效果；监控运行中会在下一轮刷新自动应用。徽章只作用于基础卡片模板。", 11, MUTED, false);
+        hint.setLineSpacing(dp(3), 1f);
+        hint.setPadding(dp(2), dp(10), dp(2), dp(2));
+        list.addView(hint, matchWidth());
+
+        islandStyleDialog = new AlertDialog.Builder(this)
+                .setTitle("显示样式")
+                .setView(list)
+                .setNegativeButton("关闭", null)
+                .setPositiveButton("立即预览", (dialog, which) -> previewIslandNow())
+                .show();
+    }
+
+    /** saver 负责完整的"读取-修改-保存"，避免闭包捕获到过期的配置对象 */
+    private void pickStyleOption(String title, String[] labels, String[] values, String current, java.util.function.Consumer<String> saver) {
+        int checked = -1;
+        for (int i = 0; i < values.length; i++) {
+            if (values[i].equals(current)) checked = i;
+        }
+        new AlertDialog.Builder(this)
+                .setTitle(title)
+                .setSingleChoiceItems(labels, checked, (dialog, which) -> {
+                    saver.accept(values[which]);
+                    dialog.dismiss();
+                    showIslandStyleDialog();
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    private java.util.function.Consumer<String> styleSaver(java.util.function.BiConsumer<IslandConfig, String> setter) {
+        return value -> {
+            IslandConfig config = IslandConfig.load(this);
+            setter.accept(config, value);
+            config.save(this);
+        };
+    }
+
+    private String cardTemplateLabel(String value) {
+        switch (value == null ? "" : value) {
+            case "chat": return "头像气泡";
+            case "highlight": return "高亮大字";
+            case "cover": return "封面大图";
+            case "animtext": return "动画图标文字";
+            case "icontext": return "图标文字";
+            default: return "基础卡片";
+        }
+    }
+
+    private String cardBgLabel(String value) {
+        switch (value == null ? "" : value) {
+            case "black": return "炭黑";
+            case "none": return "跟随系统";
+            default: return "品牌墨绿";
+        }
+    }
+
+    private String progressLabel(String value) {
+        switch (value == null ? "" : value) {
+            case "single": return "单进度条";
+            case "multi": return "多进度条（逐账号）";
+            case "none": return "不显示";
+            default: return "自动";
+        }
+    }
+
+    private String liveStyleLabel(String value) {
+        switch (value == null ? "" : value) {
+            case "progress": return "分段进度条";
+            case "text": return "文本明细";
+            default: return "自动";
+        }
+    }
+
     private void runIslandDiagnostics() {
         toast("正在自检…");
         new Thread(() -> {
@@ -819,7 +937,7 @@ public final class MainActivity extends ComponentActivity {
                 config.sequence++;
                 config.save(this);
                 FocusNotificationFactory.IslandData data = FocusNotificationFactory.parse(snapshot);
-                android.app.Notification notification = FocusNotificationFactory.build(this, data, config.sequence, true);
+                android.app.Notification notification = FocusNotificationFactory.build(this, data, config.sequence, true, config);
                 XmsfBypass.notifyNow(this, QuotaIslandService.NOTIFICATION_ISLAND, notification);
             } catch (Exception failure) {
                 error = failure.getMessage() == null ? failure.getClass().getSimpleName() : failure.getMessage();

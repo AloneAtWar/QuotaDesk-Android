@@ -141,7 +141,7 @@ public final class QuotaIslandService extends Service {
         FocusNotificationFactory.IslandData data = FocusNotificationFactory.parse(snapshot);
         config.sequence++;
         config.save(this);
-        Notification notification = FocusNotificationFactory.build(this, data, config.sequence, config.sequence <= 1);
+        Notification notification = FocusNotificationFactory.build(this, data, config.sequence, config.sequence <= 1, config);
         XmsfBypass.notifyNow(this, NOTIFICATION_ISLAND, notification);
         return data;
     }

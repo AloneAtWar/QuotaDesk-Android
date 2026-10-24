@@ -27,6 +27,18 @@ public final class IslandConfig {
     public long sequence;
     public int intervalMinutes = 5;
 
+    // ---- 显示样式（全部可在设置里切换） ----
+    /** 焦点通知卡片模板：auto(=base)/base/chat/highlight/cover/animtext/icontext */
+    public String cardTemplate = "auto";
+    /** 卡片背景：brand(品牌墨绿)/black(炭黑)/none(跟随系统) */
+    public String cardBg = "brand";
+    /** 进度条：auto(单账号单条/多账号多条)/single/multi/none */
+    public String progressMode = "auto";
+    /** 基础卡片上把剩余值显示为彩色徽章 */
+    public boolean showBadge = true;
+    /** Android 16 实时活动样式：auto/progress(分段进度条)/text(逐账号文本) */
+    public String liveStyle = "auto";
+
     public static IslandConfig load(Context context) {
         IslandConfig config = new IslandConfig();
         String encoded = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY, "");
@@ -43,6 +55,11 @@ public final class IslandConfig {
             config.sequence = json.optLong("sequence", 0L);
             int interval = json.optInt("intervalMinutes", 5);
             config.intervalMinutes = interval >= 1 && interval <= 120 ? interval : 5;
+            config.cardTemplate = nonEmpty(json.optString("cardTemplate", "auto"), "auto");
+            config.cardBg = nonEmpty(json.optString("cardBg", "brand"), "brand");
+            config.progressMode = nonEmpty(json.optString("progressMode", "auto"), "auto");
+            config.showBadge = json.optBoolean("showBadge", true);
+            config.liveStyle = nonEmpty(json.optString("liveStyle", "auto"), "auto");
         } catch (JSONException ignored) {
         }
         return config;
@@ -59,7 +76,12 @@ public final class IslandConfig {
                     .put("token", token)
                     .put("tokenPairedAt", tokenPairedAt)
                     .put("sequence", sequence)
-                    .put("intervalMinutes", intervalMinutes);
+                    .put("intervalMinutes", intervalMinutes)
+                    .put("cardTemplate", cardTemplate)
+                    .put("cardBg", cardBg)
+                    .put("progressMode", progressMode)
+                    .put("showBadge", showBadge)
+                    .put("liveStyle", liveStyle);
             context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                     .edit().putString(KEY, json.toString()).apply();
         } catch (JSONException ignored) {
@@ -67,8 +89,7 @@ public final class IslandConfig {
     }
 
     /** 电脑端 HTTP 服务的根地址（scheme://authority），API 路径在此基础上拼接 */
-    public String origin() {
-        if (baseUrl == null || baseUrl.isEmpty()) return "";
+    public String origin() {        if (baseUrl == null || baseUrl.isEmpty()) return "";
         Uri uri = Uri.parse(baseUrl);
         String host = uri.getHost();
         if (host == null || host.isEmpty()) return "";
@@ -76,6 +97,10 @@ public final class IslandConfig {
                 .append("://").append(host);
         if (uri.getPort() != -1) origin.append(':').append(uri.getPort());
         return origin.toString();
+    }
+
+    private static String nonEmpty(String value, String fallback) {
+        return value == null || value.trim().isEmpty() ? fallback : value.trim();
     }
 
     /** 本机在电脑端配对设备列表里的稳定标识；电脑端要求 ^[\w-]{8,128}$，首次需要时生成并应由调用方 save */
